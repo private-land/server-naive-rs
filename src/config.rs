@@ -234,6 +234,14 @@ impl CliArgs {
             return Err(anyhow!("heartbeat_interval must be greater than 0"));
         }
 
+        const VALID_LOG_MODES: &[&str] = &["trace", "debug", "info", "warn", "error"];
+        if !VALID_LOG_MODES.contains(&self.log_mode.to_lowercase().as_str()) {
+            return Err(anyhow!(
+                "Invalid log_mode '{}'. Valid values: trace, debug, info, warn, error",
+                self.log_mode
+            ));
+        }
+
         if let Some(ref path) = self.acl_conf_file {
             if !path.exists() {
                 return Err(anyhow!("ACL config file not found: {}", path.display()));
@@ -518,5 +526,28 @@ mod tests {
     #[test]
     fn test_parse_ip_version_invalid() {
         assert!(parse_ip_version("invalid").is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_log_mode() {
+        let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
+        cli.log_mode = "foobar".to_string();
+        assert!(
+            cli.validate().is_err(),
+            "validate() must reject unknown log_mode values"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_log_modes() {
+        let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
+        for mode in &["trace", "debug", "info", "warn", "error"] {
+            cli.log_mode = mode.to_string();
+            assert!(
+                cli.validate().is_ok(),
+                "log_mode '{}' should be valid",
+                mode
+            );
+        }
     }
 }
