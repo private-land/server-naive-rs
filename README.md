@@ -1,12 +1,12 @@
-# server-naive
+# server-naive-agent
 
-Rust implementation of the [NaiveProxy](https://github.com/klzgrad/naiveproxy) server. Communicates with the panel directly via HTTP API for config, user sync, and traffic reporting.
+Rust implementation of the [NaiveProxy](https://github.com/klzgrad/naiveproxy) server agent. Communicates with the panel via **Connect-RPC over QUIC/H3** for config, user sync, and traffic reporting.
 
 ## Features
 
 - **HTTP/2 CONNECT** — TLS + H2 proxy tunneling with UUID-based Basic Auth
 - **HTTP/3 / QUIC** — Experimental H3 transport mode (panel-configured)
-- **HTTP panel integration** — Fetches node config, syncs users, reports traffic, and sends heartbeat via panel HTTP API
+- **Connect-RPC panel integration** — Fetches node config, syncs users, reports traffic, and sends heartbeat via gRPC/QUIC
 - **ACL routing** — Rule-based outbound routing with geo-data support and private IP blocking
 - **Hot reload** — Automatic user list sync with connection kick on user removal/change
 - **Auto resource tuning** — Derives max connections from `min(cpu_throughput, ram_budget, fd_limit)`
@@ -15,10 +15,10 @@ Rust implementation of the [NaiveProxy](https://github.com/klzgrad/naiveproxy) s
 ## Usage
 
 ```bash
-server-naive \
+server-naive-agent \
   --node 1 \
-  --api  http://127.0.0.1:8080 \
-  --token your-panel-token \
+  --server_host 127.0.0.1 \
+  --port 8082 \
   --cert_file /root/.cert/server.crt \
   --key_file  /root/.cert/server.key
 ```
@@ -28,8 +28,10 @@ server-naive \
 | Argument | Env | Default | Description |
 |----------|-----|---------|-------------|
 | `--node` | `X_PANDA_NAIVE_NODE` | *required* | Node ID |
-| `--api` | `X_PANDA_NAIVE_API` | `http://127.0.0.1:8080` | Panel HTTP API base URL |
-| `--token` | `X_PANDA_NAIVE_TOKEN` | — | Panel API token |
+| `--server_host` | `X_PANDA_NAIVE_SERVER_HOST` | `127.0.0.1` | Panel server host |
+| `--port` | `X_PANDA_NAIVE_PORT` | `8082` | Panel server port |
+| `--server_name` | `X_PANDA_NAIVE_SERVER_NAME` | *(server_host)* | TLS SNI for panel connection |
+| `--ca_file` | `X_PANDA_NAIVE_CA_FILE` | — | CA certificate path (None = system trust store) |
 | `--cert_file` | `X_PANDA_NAIVE_CERT_FILE` | `/root/.cert/server.crt` | TLS certificate path |
 | `--key_file` | `X_PANDA_NAIVE_KEY_FILE` | `/root/.cert/server.key` | TLS private key path |
 | `--log_mode` | `X_PANDA_NAIVE_LOG_MODE` | `info` | Log level: `trace` / `debug` / `info` / `warn` / `error` |
@@ -51,7 +53,7 @@ server-naive \
 | `--fetch_users_interval` | `X_PANDA_NAIVE_FETCH_USERS_INTERVAL` | `60s` | User sync interval |
 | `--report_traffics_interval` | `X_PANDA_NAIVE_REPORT_TRAFFICS_INTERVAL` | `100s` | Traffic report interval |
 | `--heartbeat_interval` | `X_PANDA_NAIVE_HEARTBEAT_INTERVAL` | `180s` | Heartbeat interval |
-| `--api_timeout` | `X_PANDA_NAIVE_API_TIMEOUT` | `15` | Panel API timeout (seconds) |
+| `--api_timeout` | `X_PANDA_NAIVE_API_TIMEOUT` | `15s` | Panel API timeout |
 
 ## Build
 
@@ -59,9 +61,9 @@ server-naive \
 cargo build --release
 ```
 
-Release binary is at `target/release/server-naive`.
+Release binary is at `target/release/server-naive-agent`.
 
-> The panel integration uses HTTP API directly (`panel-http`), not gRPC/QUIC.
+> Panel integration uses Connect-RPC over QUIC/H3 (`panel-connect-rpc`).
 
 ## Architecture
 
@@ -78,7 +80,7 @@ src/
   error.rs         — Error types
   net.rs           — Socket helpers
   uot.rs           — UDP-over-TCP framing
-  business/        — Panel type bridging (HTTP API manager, user/stats wrappers)
+  business/        — Panel type bridging (Connect-RPC manager, user/stats wrappers)
   core/
     hooks.rs       — Authenticator / StatsCollector / OutboundRouter traits
     server.rs      — Server struct holding shared dependencies
