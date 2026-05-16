@@ -245,6 +245,12 @@ impl CliArgs {
             ));
         }
 
+        if let Some(ref ca) = self.ca_file {
+            if !std::path::Path::new(ca).exists() {
+                return Err(anyhow!("CA certificate file not found: {}", ca));
+            }
+        }
+
         if let Some(ref path) = self.acl_conf_file {
             if !path.exists() {
                 return Err(anyhow!("ACL config file not found: {}", path.display()));
@@ -462,9 +468,23 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_args_validate_zero_port() {
+        let mut cli = create_test_cli_args();
+        cli.port = 0;
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
     fn test_cli_args_validate_invalid_node_id() {
         let mut cli = create_test_cli_args();
         cli.node = 0;
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_ca_file_not_found() {
+        let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
+        cli.ca_file = Some("/nonexistent/ca.pem".to_string());
         assert!(cli.validate().is_err());
     }
 

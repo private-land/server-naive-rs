@@ -54,7 +54,6 @@ tokio-test = "0.4"
 tempfile = "3.15"
 dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
 panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
-panel-connect-rpc = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
 
 [profile.release]
 opt-level = 3
