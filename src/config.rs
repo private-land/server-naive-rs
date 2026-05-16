@@ -36,13 +36,13 @@ const DEFAULT_DATA_DIR: &str = "/var/lib/naive-agent-node";
 #[command(author, version, about = "Naive Proxy Server Agent with Panel Integration")]
 #[command(rename_all = "snake_case")]
 pub struct CliArgs {
-    /// Panel server host
-    #[arg(long = "server_host", env = "X_PANDA_NAIVE_SERVER_HOST", default_value = "127.0.0.1")]
-    pub server_host: String,
+    /// Panel HTTP API base URL (e.g. http://127.0.0.1:8080)
+    #[arg(long, env = "X_PANDA_NAIVE_API", default_value = "http://127.0.0.1:8080")]
+    pub api: String,
 
-    /// Panel server port
-    #[arg(long = "port", env = "X_PANDA_NAIVE_PORT", default_value_t = 8082)]
-    pub port: u16,
+    /// Panel API token
+    #[arg(long, env = "X_PANDA_NAIVE_TOKEN", default_value = "")]
+    pub token: String,
 
     /// Node ID from the panel (required)
     #[arg(long, env = "X_PANDA_NAIVE_NODE")]
@@ -68,17 +68,9 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_NAIVE_HEARTBEAT_INTERVAL", default_value = "180s", value_parser = parse_duration)]
     pub heartbeat_interval: Duration,
 
-    /// API request timeout
-    #[arg(long = "api_timeout", env = "X_PANDA_NAIVE_API_TIMEOUT", default_value = "15s", value_parser = parse_duration)]
-    pub api_timeout: Duration,
-
-    /// TLS server name (SNI) for panel connection
-    #[arg(long = "server_name", env = "X_PANDA_NAIVE_SERVER_NAME", value_name = "NAME")]
-    pub server_name: Option<String>,
-
-    /// CA certificate path for panel TLS
-    #[arg(long = "ca_file", env = "X_PANDA_NAIVE_CA_FILE", value_name = "PATH")]
-    pub ca_file: Option<String>,
+    /// API request timeout in seconds
+    #[arg(long = "api_timeout", env = "X_PANDA_NAIVE_API_TIMEOUT", default_value_t = 15)]
+    pub api_timeout: u64,
 
     /// Log mode: debug, info, warn, error
     #[arg(long, env = "X_PANDA_NAIVE_LOG_MODE", default_value = "info")]
@@ -163,8 +155,8 @@ impl CliArgs {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.server_host.is_empty() {
-            return Err(anyhow!("Panel server host is required"));
+        if self.api.is_empty() {
+            return Err(anyhow!("Panel API URL is required (--api)"));
         }
         if self.node == 0 {
             return Err(anyhow!("Node ID must be a positive integer"));
@@ -306,15 +298,15 @@ mod tests {
 
     fn create_test_cli_args() -> CliArgs {
         CliArgs {
-            server_host: "127.0.0.1".to_string(),
-            port: 8082,
+            api: "http://127.0.0.1:8080".to_string(),
+            token: "".to_string(),
             node: 1,
             cert_file: "/path/to/cert.pem".to_string(),
             key_file: "/path/to/key.pem".to_string(),
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(100),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(15),
+            api_timeout: 15,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
@@ -330,8 +322,6 @@ mod tests {
             max_connections: MaxConnections::Fixed(10_000),
             block_private_ip: true,
             refresh_geodata: false,
-            server_name: None,
-            ca_file: None,
             panel_ip_version: IpVersion::V4,
         }
     }
@@ -344,15 +334,15 @@ mod tests {
         std::fs::write(&key_path, "dummy key").unwrap();
 
         let cli = CliArgs {
-            server_host: "127.0.0.1".to_string(),
-            port: 8082,
+            api: "http://127.0.0.1:8080".to_string(),
+            token: "".to_string(),
             node: 1,
             cert_file: cert_path.to_string_lossy().to_string(),
             key_file: key_path.to_string_lossy().to_string(),
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(100),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(15),
+            api_timeout: 15,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
@@ -368,8 +358,6 @@ mod tests {
             uplink_only_timeout: Duration::from_secs(2),
             downlink_only_timeout: Duration::from_secs(5),
             max_connections: MaxConnections::Fixed(10_000),
-            server_name: None,
-            ca_file: None,
             panel_ip_version: IpVersion::V4,
         };
         (cli, temp_dir)
@@ -382,9 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_args_validate_empty_server_host() {
+    fn test_cli_args_validate_empty_api() {
         let mut cli = create_test_cli_args();
-        cli.server_host = "".to_string();
+        cli.api = "".to_string();
         assert!(cli.validate().is_err());
     }
 

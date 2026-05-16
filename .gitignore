@@ -1,5 +1,8 @@
 /target
 
+# Dev TLS certificates
+.cert/
+
 # Claude rules
 CLAUDE.md
 .claude/

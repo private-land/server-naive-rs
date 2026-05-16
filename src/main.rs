@@ -52,18 +52,17 @@ async fn main() -> Result<()> {
     let conn_manager = ConnectionManager::new();
 
     let panel_config = PanelConfig {
-        server_host: cli.server_host.clone(),
-        server_port: cli.port,
-        node_id: cli.node,
+        api: cli.api.clone(),
+        token: cli.token.clone(),
+        node_id: cli.node as i64,
         node_type: NodeType::Naive,
         data_dir: cli.data_dir.clone(),
         api_timeout: cli.api_timeout,
-        server_name: cli.server_name.clone().unwrap_or_else(|| cli.server_host.clone()),
-        ca_cert_path: cli.ca_file.clone(),
+        debug: cli.log_mode == "debug",
         ip_version: cli.panel_ip_version,
     };
 
-    let api_manager = Arc::new(ApiManager::new(panel_config));
+    let api_manager = Arc::new(ApiManager::new(panel_config)?);
 
     // UserManager<String>: UUID strings used directly as auth keys (no hashing)
     let user_manager = Arc::new(NaiveUserManager::new(|uuid: &str| uuid.to_string()));
