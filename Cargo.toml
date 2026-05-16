@@ -31,6 +31,9 @@ arc-swap = "1"
 libc = "0.2"
 base64 = "0.22"
 socket2 = "0.6"
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 # ACL Engine (remote)
 acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }

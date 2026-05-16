@@ -1,7 +1,7 @@
-//! HTTP/2 CONNECT request handler for NaiveProxy protocol.
+//! HTTP/2 and HTTP/3 CONNECT request handler for NaiveProxy protocol.
 //!
 //! Naive clients connect via:
-//!   CONNECT target:port HTTP/2
+//!   CONNECT target:port HTTP/2 (or HTTP/3)
 //!   Proxy-Authorization: Basic base64(username:password)
 //!   Padding: <random 30-61 char value>
 //!
@@ -12,7 +12,7 @@
 use crate::acl;
 use crate::core::{copy_bidirectional_with_stats, hooks, Address, Server, UserId};
 use crate::logger::log;
-use crate::transport::{generate_padding_header, H2Transport, NaivePaddedH2Transport};
+use crate::transport::{generate_padding_header, H2Transport, H3Transport, NaivePaddedTransport};
 use crate::uot;
 
 use anyhow::{anyhow, Result};
@@ -21,7 +21,7 @@ use bytes::Bytes;
 use socket2::{SockRef, TcpKeepalive};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +54,8 @@ pub fn parse_basic_auth(auth_header: &str) -> Result<String> {
         None => decoded_str.to_string(),
     })
 }
+
+// ── H2 entry point ────────────────────────────────────────────────────────────
 
 /// Process a single H2 CONNECT request.
 pub async fn process_request(
@@ -89,48 +91,29 @@ pub async fn process_request(
     let target = Address::from_authority(authority)
         .ok_or_else(|| anyhow!("Invalid target address: {}", authority))?;
 
-    // Parse Proxy-Authorization header.
-    let auth_header = match req.headers().get("proxy-authorization") {
-        Some(v) => v,
-        None => {
-            log::authentication(peer_addr, false);
-            let response = http::Response::builder()
+    // Parse and authenticate.
+    let credential = extract_credential(req.headers(), peer_addr)?;
+    let user_id = authenticate(server, &credential, peer_addr, || {
+        let _ = respond.send_response(
+            http::Response::builder()
                 .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .body(())?;
-            let _ = respond.send_response(response, true);
-            return Err(anyhow!("Missing Proxy-Authorization header"));
-        }
-    };
-
-    let auth_str = auth_header
-        .to_str()
-        .map_err(|_| anyhow!("Invalid Proxy-Authorization encoding"))?;
-    let credential = parse_basic_auth(auth_str)?;
-
-    // Authenticate user.
-    let user_id = match server.authenticator.authenticate(&credential) {
-        Some(id) => id,
-        None => {
-            log::authentication(peer_addr, false);
-            let response = http::Response::builder()
-                .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .body(())?;
-            let _ = respond.send_response(response, true);
-            return Err(anyhow!("Authentication failed for peer {}", peer_addr));
-        }
-    };
-
-    log::authentication(peer_addr, true);
-    log::debug!(peer = %peer_addr, user_id = user_id, target = %target, "CONNECT request authenticated");
+                .body(())
+                .unwrap(),
+            true,
+        );
+    })?;
 
     // Route the connection.
     let outbound_type = server.router.route(&target).await;
     if matches!(outbound_type, hooks::OutboundType::Reject) {
         log::debug!(peer = %peer_addr, target = %target, "Connection rejected by router");
-        let response = http::Response::builder()
-            .status(http::StatusCode::FORBIDDEN)
-            .body(())?;
-        let _ = respond.send_response(response, true);
+        let _ = respond.send_response(
+            http::Response::builder()
+                .status(http::StatusCode::FORBIDDEN)
+                .body(())
+                .unwrap(),
+            true,
+        );
         return Ok(());
     }
 
@@ -143,8 +126,137 @@ pub async fn process_request(
         .send_response(response, false)
         .map_err(|e| anyhow!("Failed to send 200 response: {}", e))?;
     let recv_stream = req.into_body();
-    let padded = NaivePaddedH2Transport::new(H2Transport::new(recv_stream, send_stream));
+    let padded = NaivePaddedTransport::new(H2Transport::new(recv_stream, send_stream));
 
+    process_tunnel(server, padded, target, peer_addr, user_id, outbound_type).await
+}
+
+// ── H3 entry point ────────────────────────────────────────────────────────────
+
+/// Process a single H3 CONNECT request.
+pub async fn process_h3_request<C>(
+    server: &Server,
+    req: http::Request<()>,
+    mut stream: h3::server::RequestStream<C, Bytes>,
+    peer_addr: SocketAddr,
+) -> Result<()>
+where
+    C: h3::quic::BidiStream<Bytes> + Send + 'static,
+    C::RecvStream: Send + 'static,
+    C::SendStream: Send + 'static,
+{
+    // Validate method — only CONNECT is accepted.
+    if req.method() != http::Method::CONNECT {
+        let response = http::Response::builder()
+            .status(http::StatusCode::METHOD_NOT_ALLOWED)
+            .body(())?;
+        let _ = stream.send_response(response).await;
+        let _ = stream.finish().await;
+        return Err(anyhow!("Expected CONNECT method, got {}", req.method()));
+    }
+
+    // Require the naive Padding header.
+    if req.headers().get("padding").is_none() {
+        let response = http::Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .body(())?;
+        let _ = stream.send_response(response).await;
+        let _ = stream.finish().await;
+        return Err(anyhow!("Missing naive Padding header from {}", peer_addr));
+    }
+
+    // Parse :authority header for the tunnel target.
+    let authority = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str())
+        .ok_or_else(|| anyhow!("Missing :authority in H3 CONNECT request"))?;
+    let target = Address::from_authority(authority)
+        .ok_or_else(|| anyhow!("Invalid target address: {}", authority))?;
+
+    // Parse and authenticate.
+    let credential = match extract_credential(req.headers(), peer_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = stream
+                .send_response(
+                    http::Response::builder()
+                        .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                        .body(())
+                        .unwrap(),
+                )
+                .await;
+            let _ = stream.finish().await;
+            return Err(e);
+        }
+    };
+
+    let user_id = match server.authenticator.authenticate(&credential) {
+        Some(id) => id,
+        None => {
+            log::authentication(peer_addr, false);
+            let _ = stream
+                .send_response(
+                    http::Response::builder()
+                        .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                        .body(())
+                        .unwrap(),
+                )
+                .await;
+            let _ = stream.finish().await;
+            return Err(anyhow!("Authentication failed for peer {}", peer_addr));
+        }
+    };
+    log::authentication(peer_addr, true);
+    log::debug!(peer = %peer_addr, user_id = user_id, target = %target, "H3 CONNECT authenticated");
+
+    // Route the connection.
+    let outbound_type = server.router.route(&target).await;
+    if matches!(outbound_type, hooks::OutboundType::Reject) {
+        log::debug!(peer = %peer_addr, target = %target, "H3 connection rejected by router");
+        let _ = stream
+            .send_response(
+                http::Response::builder()
+                    .status(http::StatusCode::FORBIDDEN)
+                    .body(())
+                    .unwrap(),
+            )
+            .await;
+        let _ = stream.finish().await;
+        return Ok(());
+    }
+
+    // Send 200 Connection Established with a naive Padding response header.
+    let response = http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header("padding", generate_padding_header())
+        .body(())?;
+    stream
+        .send_response(response)
+        .await
+        .map_err(|e| anyhow!("Failed to send H3 200 response: {}", e))?;
+
+    // Wrap the H3 stream as AsyncRead + AsyncWrite and apply padding protocol.
+    let transport = H3Transport::new(stream, server.conn_config.buffer_size);
+    let padded = NaivePaddedTransport::new(transport);
+
+    process_tunnel(server, padded, target, peer_addr, user_id, outbound_type).await
+}
+
+// ── Shared tunnel logic ───────────────────────────────────────────────────────
+
+/// Common post-auth tunnel processing (works for both H2 and H3).
+async fn process_tunnel<T>(
+    server: &Server,
+    mut padded: NaivePaddedTransport<T>,
+    target: Address,
+    peer_addr: SocketAddr,
+    user_id: UserId,
+    outbound_type: hooks::OutboundType,
+) -> Result<()>
+where
+    T: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Register connection for tracking and kick capability.
     let (conn_id, cancel_token) = server.conn_manager.register(user_id, peer_addr);
     let _guard = scopeguard::guard((), |_| {
@@ -181,7 +293,7 @@ pub async fn process_request(
         hooks::OutboundType::Direct { resolved, handler } => {
             handle_direct_connect(
                 server,
-                padded,
+                &mut padded,
                 &target,
                 resolved,
                 handler,
@@ -194,7 +306,7 @@ pub async fn process_request(
         hooks::OutboundType::Proxy(handler) => {
             handle_proxy_connect(
                 server,
-                padded,
+                &mut padded,
                 &target,
                 handler,
                 peer_addr,
@@ -207,10 +319,48 @@ pub async fn process_request(
     }
 }
 
-/// Relay data between the padded H2 stream and a remote TCP stream.
-async fn relay<S>(
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+
+fn extract_credential(headers: &http::HeaderMap, peer_addr: SocketAddr) -> Result<String> {
+    let auth_header = match headers.get("proxy-authorization") {
+        Some(v) => v,
+        None => {
+            log::authentication(peer_addr, false);
+            return Err(anyhow!("Missing Proxy-Authorization header"));
+        }
+    };
+
+    let auth_str = auth_header
+        .to_str()
+        .map_err(|_| anyhow!("Invalid Proxy-Authorization encoding"))?;
+    parse_basic_auth(auth_str)
+}
+
+fn authenticate(
     server: &Server,
-    padded: &mut NaivePaddedH2Transport,
+    credential: &str,
+    peer_addr: SocketAddr,
+    on_fail: impl FnOnce(),
+) -> Result<UserId> {
+    match server.authenticator.authenticate(credential) {
+        Some(id) => {
+            log::authentication(peer_addr, true);
+            Ok(id)
+        }
+        None => {
+            log::authentication(peer_addr, false);
+            on_fail();
+            Err(anyhow!("Authentication failed for peer {}", peer_addr))
+        }
+    }
+}
+
+// ── Relay ─────────────────────────────────────────────────────────────────────
+
+/// Relay data between a padded transport stream and a remote TCP stream.
+async fn relay<T, S>(
+    server: &Server,
+    padded: &mut NaivePaddedTransport<T>,
     remote_stream: &mut S,
     target: &Address,
     peer_addr: SocketAddr,
@@ -218,7 +368,8 @@ async fn relay<S>(
     cancel_token: CancellationToken,
 ) -> Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    T: tokio::io::AsyncRead + AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
 {
     let relay_start = std::time::Instant::now();
     let stats = Arc::clone(&server.stats);
@@ -273,18 +424,23 @@ where
     Ok(())
 }
 
+// ── Outbound connect handlers ─────────────────────────────────────────────────
+
 /// Handle direct connection to target.
 #[allow(clippy::too_many_arguments)]
-async fn handle_direct_connect(
+async fn handle_direct_connect<T>(
     server: &Server,
-    mut padded: NaivePaddedH2Transport,
+    padded: &mut NaivePaddedTransport<T>,
     target: &Address,
     resolved: Option<std::net::SocketAddr>,
     handler: Option<Arc<acl::OutboundHandler>>,
     peer_addr: SocketAddr,
     user_id: UserId,
     cancel_token: CancellationToken,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tokio::io::AsyncRead + AsyncWrite + Unpin,
+{
     // When an ACL handler is present, delegate dialing to it.
     if let Some(handler) = handler {
         use acl::{Addr as AclAddr, AsyncOutbound};
@@ -315,7 +471,7 @@ async fn handle_direct_connect(
         log::debug!(peer = %peer_addr, target = %target, "Connected to remote (direct via handler)");
         return relay(
             server,
-            &mut padded,
+            padded,
             &mut remote_stream,
             target,
             peer_addr,
@@ -360,7 +516,7 @@ async fn handle_direct_connect(
     log::debug!(peer = %peer_addr, remote = %remote_addr, "Connected to remote (direct)");
     relay(
         server,
-        &mut padded,
+        padded,
         &mut remote_stream,
         target,
         peer_addr,
@@ -371,15 +527,18 @@ async fn handle_direct_connect(
 }
 
 /// Handle connection via ACL proxy outbound.
-async fn handle_proxy_connect(
+async fn handle_proxy_connect<T>(
     server: &Server,
-    mut padded: NaivePaddedH2Transport,
+    padded: &mut NaivePaddedTransport<T>,
     target: &Address,
     handler: Arc<acl::OutboundHandler>,
     peer_addr: SocketAddr,
     user_id: UserId,
     cancel_token: CancellationToken,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tokio::io::AsyncRead + AsyncWrite + Unpin,
+{
     use acl::{Addr as AclAddr, AsyncOutbound};
 
     let mut acl_addr = AclAddr::new(target.host().into_owned(), target.port());
@@ -403,7 +562,7 @@ async fn handle_proxy_connect(
     log::debug!(peer = %peer_addr, target = %target, handler = ?handler, "Connected via proxy");
     relay(
         server,
-        &mut padded,
+        padded,
         &mut remote_stream,
         target,
         peer_addr,

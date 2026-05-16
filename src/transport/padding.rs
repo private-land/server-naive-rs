@@ -1,8 +1,12 @@
 //! Naive proxy padding transport layer.
 //!
-//! Wraps H2Transport with the naive padding protocol: the first 8 frames in
-//! each direction use `[2B data_size BE][1B padding_size][data][random padding]`
-//! framing. After 8 frames, raw bytes flow without any extra framing.
+//! Wraps any `AsyncRead + AsyncWrite` stream with the naive padding protocol:
+//! the first 8 frames in each direction use
+//! `[2B data_size BE][1B padding_size][data][random padding]` framing.
+//! After 8 frames, raw bytes flow without any extra framing.
+//!
+//! `NaivePaddedH2Transport` and `NaivePaddedH3Transport` are type aliases for
+//! the two concrete transport types used in this codebase.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::cell::Cell;
@@ -10,8 +14,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-use super::H2Transport;
 
 /// Number of padding frames before switching to raw mode.
 const PADDING_FRAMES: u8 = 8;
@@ -73,12 +75,12 @@ pub fn generate_padding_header() -> String {
     s
 }
 
-// ── NaivePaddedH2Transport ────────────────────────────────────────────────────
+// ── NaivePaddedTransport<T> ───────────────────────────────────────────────────
 
-/// Wraps `H2Transport` and applies the naive padding protocol for the first
-/// 8 frames in each direction before switching to raw passthrough.
-pub struct NaivePaddedH2Transport {
-    inner: H2Transport,
+/// Wraps any `AsyncRead + AsyncWrite` stream `T` with the naive padding protocol
+/// for the first 8 frames in each direction before switching to raw passthrough.
+pub struct NaivePaddedTransport<T> {
+    inner: T,
 
     // ── Read state ──────────────────────────────────────────────────────────
     /// Number of padding frames fully consumed from the client.
@@ -101,8 +103,8 @@ pub struct NaivePaddedH2Transport {
     write_pending_off: usize,
 }
 
-impl NaivePaddedH2Transport {
-    pub fn new(inner: H2Transport) -> Self {
+impl<T> NaivePaddedTransport<T> {
+    pub fn new(inner: T) -> Self {
         Self {
             inner,
             read_frames_done: 0,
@@ -126,7 +128,7 @@ impl NaivePaddedH2Transport {
 //   3. If frames_done >= 8   → raw passthrough.
 //   4. Read 3-byte header    → parse next frame, loop back to 1/2.
 
-impl AsyncRead for NaivePaddedH2Transport {
+impl<T: AsyncRead + Unpin> AsyncRead for NaivePaddedTransport<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -227,7 +229,7 @@ impl AsyncRead for NaivePaddedH2Transport {
 // `write_pending`.  Subsequent calls flush the pending bytes before accepting
 // new data.  After 8 frames, writes pass through to `inner` unmodified.
 
-impl AsyncWrite for NaivePaddedH2Transport {
+impl<T: AsyncWrite + Unpin> AsyncWrite for NaivePaddedTransport<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -245,7 +247,7 @@ impl AsyncWrite for NaivePaddedH2Transport {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
-                        "H2 write returned zero",
+                        "transport write returned zero",
                     )));
                 }
                 Poll::Ready(Ok(n)) => {
@@ -280,7 +282,7 @@ impl AsyncWrite for NaivePaddedH2Transport {
         this.write_pending_off = 0;
         this.write_frames_done += 1;
 
-        // Try to flush immediately (common case: H2 window is open).
+        // Try to flush immediately (common case: window is open).
         let pending = this.write_pending.as_ref().unwrap().clone();
         match Pin::new(&mut this.inner).poll_write(cx, &pending) {
             Poll::Ready(Ok(n)) if n > 0 => {
@@ -310,7 +312,7 @@ impl AsyncWrite for NaivePaddedH2Transport {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
-                        "H2 write returned zero during flush",
+                        "transport write returned zero during flush",
                     )));
                 }
                 Poll::Ready(Ok(n)) => {

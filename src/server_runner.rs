@@ -1,18 +1,23 @@
-//! Server startup and accept loop for Naive proxy.
+//! Server startup and accept loops for Naive proxy.
 //!
-//! Connection flow:
+//! H2/TCP flow:
 //!   TCP accept → TLS handshake (ALPN h2) → H2 server handshake
 //!   → accept H2 streams (CONNECT requests) → handler::process_request
+//!
+//! H3/QUIC flow:
+//!   QUIC accept → TLS 1.3 (ALPN h3) → H3 connection
+//!   → accept H3 streams (CONNECT requests) → handler::process_h3_request
 
 use crate::acl;
 use crate::config;
 use crate::core::{hooks, Server};
-use crate::handler::process_request;
+use crate::handler::{process_h3_request, process_request};
 use crate::logger::log;
-use crate::transport::load_tls_config;
+use crate::transport::{load_h3_tls_config, load_tls_config};
 use dns_cache_rs::DnsCache;
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use socket2::{SockRef, TcpKeepalive};
 use std::sync::Arc;
 
@@ -206,6 +211,147 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
             }
 
             log::debug!(peer = %peer_addr, "H2 connection closed");
+        });
+    }
+
+    Ok(())
+}
+
+// ── H3/QUIC server ────────────────────────────────────────────────────────────
+
+/// Run the Naive H3/QUIC server accept loop.
+///
+/// Connection flow:
+///   UDP QUIC accept → TLS 1.3 handshake (ALPN h3) → H3 connection
+///   → accept H3 CONNECT streams → handler::process_h3_request
+pub async fn run_h3_server(server: Arc<Server>, config: &config::ServerConfig) -> Result<()> {
+    use quinn::crypto::rustls::QuicServerConfig;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use tokio::sync::Semaphore;
+
+    let cert = config.cert.as_ref().expect("cert required");
+    let key = config.key.as_ref().expect("key required");
+
+    let tls_config = load_h3_tls_config(cert, key)?;
+    let quinn_crypto = QuicServerConfig::try_from(tls_config)
+        .map_err(|e| anyhow!("Failed to build Quinn TLS config: {}", e))?;
+    let quinn_server = quinn::ServerConfig::with_crypto(Arc::new(quinn_crypto));
+
+    // Try IPv6 dual-stack first, fall back to IPv4-only.
+    let addr_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.port);
+    let endpoint = match quinn::Endpoint::server(quinn_server.clone(), addr_v6) {
+        Ok(ep) => ep,
+        Err(_) => {
+            let addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port);
+            quinn::Endpoint::server(quinn_server, addr_v4)?
+        }
+    };
+
+    let local_addr = endpoint.local_addr()?;
+
+    // Connection limiter (per-stream semantics match the H2 approach).
+    let conn_limiter = if server.conn_config.max_connections > 0 {
+        Some(Arc::new(Semaphore::new(server.conn_config.max_connections)))
+    } else {
+        None
+    };
+
+    log::info!(
+        address = %local_addr,
+        tls = true,
+        transport = "h3",
+        max_connections = server.conn_config.max_connections,
+        "Naive H3 server started"
+    );
+
+    while let Some(incoming) = endpoint.accept().await {
+        let peer_addr = incoming.remote_address();
+        log::connection(peer_addr, "new (quic)");
+
+        let _permit = if let Some(ref limiter) = conn_limiter {
+            match limiter.clone().acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => break, // semaphore closed → shutting down
+            }
+        } else {
+            None
+        };
+
+        let server = Arc::clone(&server);
+
+        tokio::spawn(async move {
+            let _permit = _permit;
+
+            // Complete QUIC handshake (TLS 1.3 + ALPN h3).
+            let quic_conn = match tokio::time::timeout(
+                server.conn_config.tls_handshake_timeout,
+                incoming,
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    log::debug!(peer = %peer_addr, error = %e, stage = "quic_handshake", "Connection failed");
+                    return;
+                }
+                Err(_) => {
+                    log::debug!(peer = %peer_addr, stage = "quic_handshake_timeout", "Connection failed");
+                    return;
+                }
+            };
+
+            log::debug!(peer = %peer_addr, "QUIC connection established");
+
+            // Upgrade to HTTP/3.
+            let mut h3_conn = match tokio::time::timeout(
+                server.conn_config.request_timeout,
+                h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(quic_conn)),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    log::debug!(peer = %peer_addr, error = %e, stage = "h3_handshake", "Connection failed");
+                    return;
+                }
+                Err(_) => {
+                    log::debug!(peer = %peer_addr, stage = "h3_handshake_timeout", "Connection timed out");
+                    return;
+                }
+            };
+
+            log::debug!(peer = %peer_addr, "H3 connection established");
+
+            // Accept H3 streams (each stream is one CONNECT tunnel).
+            // h3 0.0.8: accept() returns a RequestResolver; resolve_request() gives (Request, Stream).
+            loop {
+                match h3_conn.accept().await {
+                    Ok(Some(resolver)) => {
+                        let server = Arc::clone(&server);
+                        tokio::spawn(async move {
+                            match resolver.resolve_request().await {
+                                Ok((req, stream)) => {
+                                    if let Err(e) =
+                                        process_h3_request(&server, req, stream, peer_addr).await
+                                    {
+                                        log::debug!(peer = %peer_addr, error = %e, "H3 request error");
+                                    }
+                                }
+                                Err(e) => {
+                                    log::debug!(peer = %peer_addr, error = %e, "H3 resolve error");
+                                }
+                            }
+                        });
+                    }
+                    Ok(None) => break, // connection closed cleanly
+                    Err(e) => {
+                        log::debug!(peer = %peer_addr, error = %e, "H3 accept error");
+                        break;
+                    }
+                }
+            }
+
+            log::debug!(peer = %peer_addr, "H3 connection closed");
         });
     }
 

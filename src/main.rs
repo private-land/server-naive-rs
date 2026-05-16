@@ -78,13 +78,7 @@ async fn main() -> Result<()> {
         "Node config fetched"
     );
 
-    if naive_config.network == config::NaiveNetwork::Udp {
-        return Err(anyhow::anyhow!(
-            "Panel node is configured as network=udp (H3/QUIC), \
-             but this agent only supports network=tcp (H2+TLS). \
-             Change the node's network setting to 'tcp' in the panel."
-        ));
-    }
+    let use_h3 = naive_config.network == config::NaiveNetwork::Udp;
 
     // Register node with panel
     api_manager.initialize(naive_config.server_port).await?;
@@ -217,7 +211,13 @@ async fn main() -> Result<()> {
     });
 
     let server_result = tokio::select! {
-        result = server_runner::run_server(server, &server_config) => result,
+        result = async {
+            if use_h3 {
+                server_runner::run_h3_server(server, &server_config).await
+            } else {
+                server_runner::run_server(server, &server_config).await
+            }
+        } => result,
         _ = cancel_token.cancelled() => Ok(()),
     };
 
