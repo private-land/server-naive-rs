@@ -1,0 +1,9 @@
+/target
+
+# Claude rules
+CLAUDE.md
+.claude/
+
+# Docs
+docs/superpowers/
+docs/specs/
