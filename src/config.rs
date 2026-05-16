@@ -250,12 +250,35 @@ impl CliArgs {
     }
 }
 
+/// Transport network mode for a naive node.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NaiveNetwork {
+    /// HTTP/2 over TLS (default).
+    #[default]
+    Tcp,
+    /// HTTP/3 over QUIC.
+    Udp,
+}
+
+impl std::fmt::Display for NaiveNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NaiveNetwork::Tcp => write!(f, "tcp"),
+            NaiveNetwork::Udp => write!(f, "udp"),
+        }
+    }
+}
+
 /// Naive node configuration deserialized from panel API JSON.
 ///
 /// The panel returns `NodeConfigEnum::Naive(json_string)`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NaiveConfig {
     pub server_port: u16,
+    /// Transport mode: "tcp" (H2+TLS, default) or "udp" (H3+QUIC).
+    #[serde(default)]
+    pub network: NaiveNetwork,
 }
 
 /// Parse a `NodeConfigEnum` into a `NaiveConfig`.
@@ -436,6 +459,16 @@ mod tests {
         let config_enum = NodeConfigEnum::Naive(json.to_string());
         let config = parse_naive_config(config_enum).unwrap();
         assert_eq!(config.server_port, 443);
+        assert_eq!(config.network, NaiveNetwork::Tcp); // defaults to tcp
+    }
+
+    #[test]
+    fn test_parse_naive_config_with_network() {
+        let json = r#"{"server_port":443,"network":"udp"}"#;
+        let config_enum = NodeConfigEnum::Naive(json.to_string());
+        let config = parse_naive_config(config_enum).unwrap();
+        assert_eq!(config.server_port, 443);
+        assert_eq!(config.network, NaiveNetwork::Udp);
     }
 
     #[test]
@@ -446,7 +479,10 @@ mod tests {
 
     #[test]
     fn test_server_config_from_remote() {
-        let remote = NaiveConfig { server_port: 443 };
+        let remote = NaiveConfig {
+            server_port: 443,
+            network: NaiveNetwork::Tcp,
+        };
         let cli = create_test_cli_args();
         let config = ServerConfig::from_remote(&remote, &cli).unwrap();
         assert_eq!(config.port, 443);

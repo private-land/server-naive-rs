@@ -72,6 +72,20 @@ async fn main() -> Result<()> {
     let node_config = api_manager.fetch_config().await?;
     let naive_config = config::parse_naive_config(node_config)?;
 
+    log::info!(
+        network = %naive_config.network,
+        port = naive_config.server_port,
+        "Node config fetched"
+    );
+
+    if naive_config.network == config::NaiveNetwork::Udp {
+        return Err(anyhow::anyhow!(
+            "Panel node is configured as network=udp (H3/QUIC), \
+             but this agent only supports network=tcp (H2+TLS). \
+             Change the node's network setting to 'tcp' in the panel."
+        ));
+    }
+
     // Register node with panel
     api_manager.initialize(naive_config.server_port).await?;
     log::info!("Node initialized");
