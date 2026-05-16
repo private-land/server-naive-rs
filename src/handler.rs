@@ -94,26 +94,22 @@ pub async fn process_request(
     // Parse and authenticate.
     let credential = extract_credential(req.headers(), peer_addr)?;
     let user_id = authenticate(server, &credential, peer_addr, || {
-        let _ = respond.send_response(
-            http::Response::builder()
-                .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .body(())
-                .unwrap(),
-            true,
-        );
+        if let Ok(r) = http::Response::builder()
+            .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .body(())
+        {
+            let _ = respond.send_response(r, true);
+        }
     })?;
 
     // Route the connection.
     let outbound_type = server.router.route(&target).await;
     if matches!(outbound_type, hooks::OutboundType::Reject) {
         log::debug!(peer = %peer_addr, target = %target, "Connection rejected by router");
-        let _ = respond.send_response(
-            http::Response::builder()
-                .status(http::StatusCode::FORBIDDEN)
-                .body(())
-                .unwrap(),
-            true,
-        );
+        let response = http::Response::builder()
+            .status(http::StatusCode::FORBIDDEN)
+            .body(())?;
+        let _ = respond.send_response(response, true);
         return Ok(());
     }
 
@@ -178,14 +174,10 @@ where
     let credential = match extract_credential(req.headers(), peer_addr) {
         Ok(c) => c,
         Err(e) => {
-            let _ = stream
-                .send_response(
-                    http::Response::builder()
-                        .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                        .body(())
-                        .unwrap(),
-                )
-                .await;
+            let response = http::Response::builder()
+                .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                .body(())?;
+            let _ = stream.send_response(response).await;
             let _ = stream.finish().await;
             return Err(e);
         }
@@ -195,14 +187,10 @@ where
         Some(id) => id,
         None => {
             log::authentication(peer_addr, false);
-            let _ = stream
-                .send_response(
-                    http::Response::builder()
-                        .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                        .body(())
-                        .unwrap(),
-                )
-                .await;
+            let response = http::Response::builder()
+                .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                .body(())?;
+            let _ = stream.send_response(response).await;
             let _ = stream.finish().await;
             return Err(anyhow!("Authentication failed for peer {}", peer_addr));
         }
@@ -214,14 +202,10 @@ where
     let outbound_type = server.router.route(&target).await;
     if matches!(outbound_type, hooks::OutboundType::Reject) {
         log::debug!(peer = %peer_addr, target = %target, "H3 connection rejected by router");
-        let _ = stream
-            .send_response(
-                http::Response::builder()
-                    .status(http::StatusCode::FORBIDDEN)
-                    .body(())
-                    .unwrap(),
-            )
-            .await;
+        let response = http::Response::builder()
+            .status(http::StatusCode::FORBIDDEN)
+            .body(())?;
+        let _ = stream.send_response(response).await;
         let _ = stream.finish().await;
         return Ok(());
     }

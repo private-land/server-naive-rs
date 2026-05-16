@@ -46,7 +46,7 @@ panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v
 panel-http = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
 
 [[bin]]
-name = "server-naive-agent"
+name = "server-naive"
 path = "src/main.rs"
 
 [dev-dependencies]
