@@ -3,6 +3,9 @@
 # Dev TLS certificates
 .cert/
 
+# Local ACL config
+acl.yaml
+
 # Claude rules
 CLAUDE.md
 .claude/
