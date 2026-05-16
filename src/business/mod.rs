@@ -9,11 +9,13 @@ use std::sync::Arc;
 use crate::core::hooks::{Authenticator, StatsCollector};
 use crate::core::UserId;
 
+pub use panel_connect_rpc::{
+    ConnectRpcApiManager as ApiManager, ConnectRpcPanelConfig as PanelConfig, IpVersion,
+};
 pub use panel_core::{
     BackgroundTasks, NodeConfigEnum, NodeType, PanelApi, StatsCollector as PanelStatsCollector,
     TaskConfig, UserManager,
 };
-pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig, IpVersion};
 
 /// Naive-specific UserManager using UUID strings as keys directly.
 pub type NaiveUserManager = UserManager<String>;
