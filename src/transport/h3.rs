@@ -123,6 +123,9 @@ where
         }
     }
 
+    // rx is still in scope here; drop(JoinHandle) would only detach the task,
+    // leaving it running until bridge() returns and rx is finally dropped.
+    // abort() cancels it immediately at the next await point instead.
     read_task.abort();
 
     // Close the H3 send side cleanly so the client sees a proper stream end.

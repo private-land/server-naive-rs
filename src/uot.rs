@@ -29,6 +29,9 @@ use crate::core::hooks::StatsCollector;
 use crate::core::UserId;
 use crate::logger::log;
 
+/// Matches the shutdown timeout used in the TCP relay path.
+const UOT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 // ── Magic addresses ───────────────────────────────────────────────────────────
 
 const MAGIC_V2: &str = "sp.v2.udp-over-tcp.arpa";
@@ -134,6 +137,21 @@ async fn write_addr_parser<W: AsyncWrite + Unpin>(w: &mut W, addr: SocketAddr) -
     Ok(())
 }
 
+/// Writes one UoT packet (per-packet address prefix + 2B length + payload).
+async fn write_uot_packet<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    from: SocketAddr,
+    data: &[u8],
+    is_connect: bool,
+) -> Result<()> {
+    if !is_connect {
+        write_addr_parser(writer, from).await?;
+    }
+    writer.write_u16(data.len() as u16).await?;
+    writer.write_all(data).await?;
+    Ok(())
+}
+
 // ── DNS resolution ────────────────────────────────────────────────────────────
 
 async fn resolve_host(dns: &DnsCache, host: &str, port: u16) -> Result<SocketAddr> {
@@ -153,6 +171,10 @@ async fn resolve_host(dns: &DnsCache, host: &str, port: u16) -> Result<SocketAdd
 /// Handle a UDP-over-TCP stream after the 200 OK has been sent.
 ///
 /// `stream` is the padded H2 stream (implements `AsyncRead + AsyncWrite`).
+///
+/// Uses `tokio::join!` so the output half always reaches `h2_writer.shutdown()`
+/// regardless of whether the relay ends naturally or is cancelled by `cancel`.
+/// This ensures the H2 write side sends a clean FIN instead of an abrupt RST.
 pub async fn handle_uot_stream<S>(
     mut stream: S,
     version: UotVersion,
@@ -208,54 +230,96 @@ where
     let stats_out = Arc::clone(&stats);
     let dns2 = dns.clone();
 
+    // When either direction ends (error or cancel), signal the other to stop.
+    let inner = CancellationToken::new();
+    let cancel_a = cancel.clone();
+    let inner_a = inner.clone();
+
     // ── Input loop: H2 → UDP ──────────────────────────────────────────────────
     let input = async move {
-        loop {
-            let dest: Option<SocketAddr> = if is_connect {
-                None // connected socket; dest is implicit
-            } else {
-                let (host, port) = read_addr_parser(&mut h2_reader).await?;
-                Some(resolve_host(&dns2, &host, port).await?)
+        'read: loop {
+            let next = async {
+                let dest: Option<SocketAddr> = if is_connect {
+                    None // connected socket; dest is implicit
+                } else {
+                    let (host, port) = read_addr_parser(&mut h2_reader).await?;
+                    Some(resolve_host(&dns2, &host, port).await?)
+                };
+
+                let len = h2_reader.read_u16().await? as usize;
+                if len == 0 {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                let mut payload = vec![0u8; len];
+                h2_reader.read_exact(&mut payload).await?;
+
+                let sent = if is_connect {
+                    udp_send.send(&payload).await?
+                } else {
+                    udp_send.send_to(&payload, dest.unwrap()).await?
+                };
+                stats_in.record_upload(user_id, sent as u64);
+                Ok(())
             };
 
-            let len = h2_reader.read_u16().await? as usize;
-            if len == 0 {
-                continue;
+            tokio::select! {
+                r = next => {
+                    if let Err(e) = r {
+                        log::debug!(peer = %peer_addr, error = %e, "UoT input ended");
+                        inner_a.cancel();
+                        break 'read;
+                    }
+                }
+                _ = cancel_a.cancelled() => { inner_a.cancel(); break 'read; }
+                _ = inner_a.cancelled() => break 'read,
             }
-            let mut payload = vec![0u8; len];
-            h2_reader.read_exact(&mut payload).await?;
-
-            let sent = if is_connect {
-                udp_send.send(&payload).await?
-            } else {
-                udp_send.send_to(&payload, dest.unwrap()).await?
-            };
-            stats_in.record_upload(user_id, sent as u64);
         }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
     };
+
+    let cancel_b = cancel.clone();
+    let inner_b = inner.clone();
 
     // ── Output loop: UDP → H2 ────────────────────────────────────────────────
     let output = async move {
         let mut buf = vec![0u8; 65535];
-        loop {
-            let (n, from) = udp_recv.recv_from(&mut buf).await?;
-            if !is_connect {
-                write_addr_parser(&mut h2_writer, from).await?;
+        'write: loop {
+            tokio::select! {
+                result = udp_recv.recv_from(&mut buf) => {
+                    match result {
+                        Ok((n, from)) => {
+                            // write_uot_packet is awaited inside the handler; cancel
+                            // is not checked mid-write (intentional: avoids partial frames).
+                            if write_uot_packet(&mut h2_writer, from, &buf[..n], is_connect)
+                                .await
+                                .is_err()
+                            {
+                                inner_b.cancel();
+                                break 'write;
+                            }
+                            stats_out.record_download(user_id, n as u64);
+                        }
+                        Err(e) => {
+                            log::debug!(peer = %peer_addr, error = %e, "UoT output ended");
+                            inner_b.cancel();
+                            break 'write;
+                        }
+                    }
+                }
+                _ = cancel_b.cancelled() => { inner_b.cancel(); break 'write; }
+                _ = inner_b.cancelled() => break 'write,
             }
-            h2_writer.write_u16(n as u16).await?;
-            h2_writer.write_all(&buf[..n]).await?;
-            stats_out.record_download(user_id, n as u64);
         }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
+
+        // Always shut down the write half cleanly — gives the client a proper FIN
+        // instead of an abrupt RST regardless of whether we exited due to cancel,
+        // error, or natural EOF.
+        let _ = tokio::time::timeout(UOT_SHUTDOWN_TIMEOUT, h2_writer.shutdown()).await;
     };
 
-    tokio::select! {
-        r = input  => { if let Err(e) = r { log::debug!(peer = %peer_addr, error = %e, "UoT input ended"); } }
-        r = output => { if let Err(e) = r { log::debug!(peer = %peer_addr, error = %e, "UoT output ended"); } }
-        _ = cancel.cancelled() => { log::debug!(peer = %peer_addr, "UoT connection kicked"); }
+    tokio::join!(input, output);
+
+    if cancel.is_cancelled() {
+        log::debug!(peer = %peer_addr, "UoT connection kicked");
     }
 
     Ok(())
@@ -266,6 +330,131 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Wraps any `AsyncRead + AsyncWrite` and records whether `shutdown()` was called.
+    struct ShutdownTracker<T> {
+        inner: T,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for ShutdownTracker<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for ShutdownTracker<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl<T: Unpin> Unpin for ShutdownTracker<T> {}
+
+    struct NoopStats;
+    impl StatsCollector for NoopStats {
+        fn record_request(&self, _: UserId) {}
+        fn record_upload(&self, _: UserId, _: u64) {}
+        fn record_download(&self, _: UserId, _: u64) {}
+    }
+
+    // ── shutdown-on-cancel ────────────────────────────────────────────────────
+
+    /// RED → GREEN: shutdown() must be called on the H2 write half when the
+    /// cancel token fires — not just on natural EOF.
+    ///
+    /// Before the fix the outer `tokio::select!` dropped both futures on cancel,
+    /// so h2_writer.shutdown() was never reached.  After the fix `tokio::join!`
+    /// keeps the output future alive long enough to call shutdown().
+    #[tokio::test]
+    async fn shutdown_called_on_cancel() {
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+
+        // DuplexStream: dropping the client half makes the server half see EOF on reads.
+        let (client, server) = tokio::io::duplex(1024);
+        drop(client);
+
+        let stream = ShutdownTracker {
+            inner: server,
+            shutdown_called: shutdown_called.clone(),
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // fire immediately
+
+        handle_uot_stream(
+            stream,
+            UotVersion::V1,
+            DnsCache::new(),
+            Arc::new(NoopStats),
+            1,
+            "127.0.0.1:1".parse().unwrap(),
+            cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "h2_writer.shutdown() must be called when cancel token fires"
+        );
+    }
+
+    /// Verify shutdown() is also called when the H2 read side reaches EOF
+    /// (natural end — no external cancel involved).
+    #[tokio::test]
+    async fn shutdown_called_on_natural_eof() {
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+
+        let (client, server) = tokio::io::duplex(1024);
+        drop(client); // immediate EOF on reads
+
+        let stream = ShutdownTracker {
+            inner: server,
+            shutdown_called: shutdown_called.clone(),
+        };
+
+        handle_uot_stream(
+            stream,
+            UotVersion::V1,
+            DnsCache::new(),
+            Arc::new(NoopStats),
+            1,
+            "127.0.0.1:1".parse().unwrap(),
+            CancellationToken::new(), // never fired
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "h2_writer.shutdown() must be called on natural EOF"
+        );
+    }
+
+    // ── existing parse tests (unchanged) ─────────────────────────────────────
 
     #[test]
     fn detect_magic_v2() {
