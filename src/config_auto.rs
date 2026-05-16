@@ -184,13 +184,22 @@ mod tests {
 
     #[test]
     fn parses_auto_case_insensitive() {
-        assert_eq!("auto".parse::<MaxConnections>().unwrap(), MaxConnections::Auto);
-        assert_eq!("AUTO".parse::<MaxConnections>().unwrap(), MaxConnections::Auto);
+        assert_eq!(
+            "auto".parse::<MaxConnections>().unwrap(),
+            MaxConnections::Auto
+        );
+        assert_eq!(
+            "AUTO".parse::<MaxConnections>().unwrap(),
+            MaxConnections::Auto
+        );
     }
 
     #[test]
     fn parses_fixed_integer() {
-        assert_eq!("5000".parse::<MaxConnections>().unwrap(), MaxConnections::Fixed(5000));
+        assert_eq!(
+            "5000".parse::<MaxConnections>().unwrap(),
+            MaxConnections::Fixed(5000)
+        );
     }
 
     #[test]

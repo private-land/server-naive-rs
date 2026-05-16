@@ -29,7 +29,13 @@ pub struct H2Transport {
 
 impl H2Transport {
     pub fn new(recv: RecvStream, send: SendStream<Bytes>) -> Self {
-        Self { recv, send, read_buf: Bytes::new(), pending_release: 0, closed: false }
+        Self {
+            recv,
+            send,
+            read_buf: Bytes::new(),
+            pending_release: 0,
+            closed: false,
+        }
     }
 }
 
@@ -129,10 +135,7 @@ impl AsyncWrite for H2Transport {
                 }
                 Poll::Ready(Some(Ok(_))) => return Poll::Pending,
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "H2 capacity error: {}",
-                        e
-                    ))));
+                    return Poll::Ready(Err(io::Error::other(format!("H2 capacity error: {}", e))));
                 }
                 Poll::Ready(None) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -201,7 +204,10 @@ mod tests {
 
         let (recv, mut respond) = stream_rx.await.unwrap();
         let h2_send = respond
-            .send_response(http::Response::builder().status(200).body(()).unwrap(), false)
+            .send_response(
+                http::Response::builder().status(200).body(()).unwrap(),
+                false,
+            )
             .unwrap();
         let _ = resp_fut.await.unwrap(); // client sees 200
 
@@ -239,7 +245,10 @@ mod tests {
 
         let (recv, mut respond) = stream_rx.await.unwrap();
         let h2_send = respond
-            .send_response(http::Response::builder().status(200).body(()).unwrap(), false)
+            .send_response(
+                http::Response::builder().status(200).body(()).unwrap(),
+                false,
+            )
             .unwrap();
         let _ = resp_fut.await.unwrap();
 
@@ -248,6 +257,9 @@ mod tests {
         let mut transport = H2Transport::new(recv, h2_send);
         let mut buf = vec![0u8; 1024];
         let result = transport.read(&mut buf).await;
-        assert!(result.is_err(), "RST_STREAM INTERNAL_ERROR must propagate as io::Error");
+        assert!(
+            result.is_err(),
+            "RST_STREAM INTERNAL_ERROR must propagate as io::Error"
+        );
     }
 }

@@ -12,7 +12,9 @@ use std::sync::Arc;
 pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> std::io::Result<Arc<ServerConfig>> {
     let cert_file = File::open(cert_path)?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader).filter_map(|r| r.ok()).collect();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .filter_map(|r| r.ok())
+        .collect();
 
     if certs.is_empty() {
         return Err(std::io::Error::new(

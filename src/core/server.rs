@@ -115,7 +115,9 @@ mod tests {
 
     impl TestStatsCollector {
         fn new() -> Self {
-            Self { requests: AtomicU64::new(0) }
+            Self {
+                requests: AtomicU64::new(0),
+            }
         }
     }
 

@@ -9,11 +9,11 @@ use std::sync::Arc;
 use crate::core::hooks::{Authenticator, StatsCollector};
 use crate::core::UserId;
 
-pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig, IpVersion};
 pub use panel_core::{
     BackgroundTasks, NodeConfigEnum, NodeType, PanelApi, StatsCollector as PanelStatsCollector,
     TaskConfig, UserManager,
 };
+pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig, IpVersion};
 
 /// Naive-specific UserManager using UUID strings as keys directly.
 pub type NaiveUserManager = UserManager<String>;
@@ -61,7 +61,10 @@ mod tests {
     #[test]
     fn test_naive_authenticator_with_users() {
         let user_manager = Arc::new(NaiveUserManager::new(|uuid: &str| uuid.to_string()));
-        let users = vec![panel_core::User { id: 42, uuid: "test-uuid-123".to_string() }];
+        let users = vec![panel_core::User {
+            id: 42,
+            uuid: "test-uuid-123".to_string(),
+        }];
         user_manager.init(&users);
 
         let auth = NaiveAuthenticator(Arc::clone(&user_manager));

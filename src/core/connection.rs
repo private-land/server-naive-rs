@@ -49,15 +49,29 @@ impl ConnectionManager {
         }
     }
 
-    pub fn register(&self, user_id: UserId, peer_addr: SocketAddr) -> (ConnectionId, CancellationToken) {
+    pub fn register(
+        &self,
+        user_id: UserId,
+        peer_addr: SocketAddr,
+    ) -> (ConnectionId, CancellationToken) {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let cancel_token = CancellationToken::new();
 
-        let info = ConnectionInfo { user_id, peer_addr, connected_at: Instant::now() };
-        let conn = ActiveConnection { info, cancel_token: cancel_token.clone() };
+        let info = ConnectionInfo {
+            user_id,
+            peer_addr,
+            connected_at: Instant::now(),
+        };
+        let conn = ActiveConnection {
+            info,
+            cancel_token: cancel_token.clone(),
+        };
 
         self.connections.insert(conn_id, conn);
-        self.user_connections.entry(user_id).or_default().insert(conn_id);
+        self.user_connections
+            .entry(user_id)
+            .or_default()
+            .insert(conn_id);
 
         (conn_id, cancel_token)
     }
@@ -65,10 +79,11 @@ impl ConnectionManager {
     pub fn unregister(&self, conn_id: ConnectionId) {
         if let Some((_, conn)) = self.connections.remove(&conn_id) {
             let user_id = conn.info.user_id;
-            self.user_connections.remove_if_mut(&user_id, |_, conn_ids| {
-                conn_ids.remove(&conn_id);
-                conn_ids.is_empty()
-            });
+            self.user_connections
+                .remove_if_mut(&user_id, |_, conn_ids| {
+                    conn_ids.remove(&conn_id);
+                    conn_ids.is_empty()
+                });
         }
     }
 
@@ -152,10 +167,8 @@ mod tests {
 
         for i in 0..10i64 {
             let m = manager.clone();
-            let (conn_id, cancel_token) = manager.register(
-                i,
-                SocketAddr::from(([127, 0, 0, 1], (1000 + i) as u16)),
-            );
+            let (conn_id, cancel_token) =
+                manager.register(i, SocketAddr::from(([127, 0, 0, 1], (1000 + i) as u16)));
             tokio::spawn(async move {
                 cancel_token.cancelled().await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -167,7 +180,9 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if manager.connection_count() == 0 { break; }
+            if manager.connection_count() == 0 {
+                break;
+            }
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

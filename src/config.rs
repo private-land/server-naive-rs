@@ -14,7 +14,10 @@ fn parse_ip_version(s: &str) -> Result<IpVersion, String> {
         "v4" | "ipv4" | "4" => Ok(IpVersion::V4),
         "v6" | "ipv6" | "6" => Ok(IpVersion::V6),
         "auto" => Ok(IpVersion::Auto),
-        _ => Err(format!("Invalid IP version '{}'. Use 'v4', 'v6', or 'auto'", s)),
+        _ => Err(format!(
+            "Invalid IP version '{}'. Use 'v4', 'v6', or 'auto'",
+            s
+        )),
     }
 }
 
@@ -23,7 +26,10 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         return Ok(d);
     }
     s.parse::<u64>().map(Duration::from_secs).map_err(|_| {
-        format!("Invalid duration '{}'. Use formats like '60s', '2m', '1h' or plain seconds", s)
+        format!(
+            "Invalid duration '{}'. Use formats like '60s', '2m', '1h' or plain seconds",
+            s
+        )
     })
 }
 
@@ -33,11 +39,19 @@ const DEFAULT_DATA_DIR: &str = "/var/lib/naive-agent-node";
 ///
 /// Supports environment variables with X_PANDA_NAIVE_ prefix
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Naive Proxy Server Agent with Panel Integration")]
+#[command(
+    author,
+    version,
+    about = "Naive Proxy Server Agent with Panel Integration"
+)]
 #[command(rename_all = "snake_case")]
 pub struct CliArgs {
     /// Panel HTTP API base URL (e.g. http://127.0.0.1:8080)
-    #[arg(long, env = "X_PANDA_NAIVE_API", default_value = "http://127.0.0.1:8080")]
+    #[arg(
+        long,
+        env = "X_PANDA_NAIVE_API",
+        default_value = "http://127.0.0.1:8080"
+    )]
     pub api: String,
 
     /// Panel API token
@@ -49,11 +63,19 @@ pub struct CliArgs {
     pub node: u32,
 
     /// TLS certificate file path
-    #[arg(long, env = "X_PANDA_NAIVE_CERT_FILE", default_value = "/root/.cert/server.crt")]
+    #[arg(
+        long,
+        env = "X_PANDA_NAIVE_CERT_FILE",
+        default_value = "/root/.cert/server.crt"
+    )]
     pub cert_file: String,
 
     /// TLS private key file path
-    #[arg(long, env = "X_PANDA_NAIVE_KEY_FILE", default_value = "/root/.cert/server.key")]
+    #[arg(
+        long,
+        env = "X_PANDA_NAIVE_KEY_FILE",
+        default_value = "/root/.cert/server.key"
+    )]
     pub key_file: String,
 
     /// Interval for fetching users
@@ -69,7 +91,11 @@ pub struct CliArgs {
     pub heartbeat_interval: Duration,
 
     /// API request timeout in seconds
-    #[arg(long = "api_timeout", env = "X_PANDA_NAIVE_API_TIMEOUT", default_value_t = 15)]
+    #[arg(
+        long = "api_timeout",
+        env = "X_PANDA_NAIVE_API_TIMEOUT",
+        default_value_t = 15
+    )]
     pub api_timeout: u64,
 
     /// Log mode: debug, info, warn, error
@@ -89,7 +115,11 @@ pub struct CliArgs {
     pub block_private_ip: bool,
 
     /// Force refresh geoip and geosite databases on startup
-    #[arg(long = "refresh_geodata", env = "X_PANDA_NAIVE_REFRESH_GEODATA", default_value_t = false)]
+    #[arg(
+        long = "refresh_geodata",
+        env = "X_PANDA_NAIVE_REFRESH_GEODATA",
+        default_value_t = false
+    )]
     pub refresh_geodata: bool,
 
     /// IP version for panel API connections: v4, v6, or auto
@@ -124,11 +154,21 @@ pub struct CliArgs {
     pub buffer_size: usize,
 
     /// TCP listen backlog for pending connections
-    #[arg(long, env = "X_PANDA_NAIVE_TCP_BACKLOG", default_value_t = 1024, help_heading = "Performance")]
+    #[arg(
+        long,
+        env = "X_PANDA_NAIVE_TCP_BACKLOG",
+        default_value_t = 1024,
+        help_heading = "Performance"
+    )]
     pub tcp_backlog: i32,
 
     /// Enable TCP_NODELAY for lower latency
-    #[arg(long, env = "X_PANDA_NAIVE_TCP_NODELAY", default_value_t = true, help_heading = "Performance")]
+    #[arg(
+        long,
+        env = "X_PANDA_NAIVE_TCP_NODELAY",
+        default_value_t = true,
+        help_heading = "Performance"
+    )]
     pub tcp_nodelay: bool,
 
     /// After client closes (upload EOF), wait this long for remote to finish
@@ -162,15 +202,22 @@ impl CliArgs {
             return Err(anyhow!("Node ID must be a positive integer"));
         }
         if self.cert_file.is_empty() {
-            return Err(anyhow!("TLS certificate file path is required (--cert_file)"));
+            return Err(anyhow!(
+                "TLS certificate file path is required (--cert_file)"
+            ));
         }
         if self.key_file.is_empty() {
-            return Err(anyhow!("TLS private key file path is required (--key_file)"));
+            return Err(anyhow!(
+                "TLS private key file path is required (--key_file)"
+            ));
         }
 
         let cert_path = std::path::Path::new(&self.cert_file);
         if !cert_path.exists() {
-            return Err(anyhow!("TLS certificate file not found: {}", self.cert_file));
+            return Err(anyhow!(
+                "TLS certificate file not found: {}",
+                self.cert_file
+            ));
         }
         let key_path = std::path::Path::new(&self.key_file);
         if !key_path.exists() {

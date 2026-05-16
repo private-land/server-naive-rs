@@ -200,8 +200,9 @@ impl OutboundHandler {
                     .transpose()?;
                 let bind_device = config.and_then(|d| d.bind_device.clone());
                 let fast_open = config.is_some_and(|d| d.fast_open);
-                let tcp_nodelay =
-                    config.map(|d| d.tcp_nodelay).unwrap_or_else(default_tcp_nodelay);
+                let tcp_nodelay = config
+                    .map(|d| d.tcp_nodelay)
+                    .unwrap_or_else(default_tcp_nodelay);
                 let tcp_keepalive_secs = config
                     .map(|d| d.tcp_keepalive_secs)
                     .unwrap_or_else(default_tcp_keepalive_secs);
@@ -221,7 +222,12 @@ impl OutboundHandler {
                     let bind_addr: std::net::SocketAddr =
                         std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 0);
                     socket.bind(&bind_addr.into()).map_err(|e| {
-                        anyhow!("FATAL: outbound '{}' bindIPv4 {} failed: {}", entry.name, ip, e)
+                        anyhow!(
+                            "FATAL: outbound '{}' bindIPv4 {} failed: {}",
+                            entry.name,
+                            ip,
+                            e
+                        )
                     })?;
                 }
                 if let Some(ip) = bind_ip6 {
@@ -234,7 +240,12 @@ impl OutboundHandler {
                     let bind_addr: std::net::SocketAddr =
                         std::net::SocketAddr::new(std::net::IpAddr::V6(ip), 0);
                     socket.bind(&bind_addr.into()).map_err(|e| {
-                        anyhow!("FATAL: outbound '{}' bindIPv6 {} failed: {}", entry.name, ip, e)
+                        anyhow!(
+                            "FATAL: outbound '{}' bindIPv6 {} failed: {}",
+                            entry.name,
+                            ip,
+                            e
+                        )
                     })?;
                 }
 
@@ -460,7 +471,10 @@ impl AclEngine {
             "ACL engine initialized"
         );
 
-        Ok(Self { compiled, outbounds })
+        Ok(Self {
+            compiled,
+            outbounds,
+        })
     }
 
     #[allow(dead_code)]
@@ -486,7 +500,10 @@ impl AclEngine {
         )
         .map_err(|e| anyhow!("Failed to compile default rules: {}", e))?;
 
-        Ok(Self { compiled, outbounds })
+        Ok(Self {
+            compiled,
+            outbounds,
+        })
     }
 
     pub fn match_host(
@@ -518,7 +535,11 @@ pub async fn load_acl_config(path: &Path) -> Result<AclConfig> {
         .map_err(|e| anyhow!("Failed to read ACL config file '{}': {}", path.display(), e))?;
 
     let config: AclConfig = serde_yaml::from_str(&content).map_err(|e| {
-        anyhow!("Failed to parse ACL config file '{}': {}", path.display(), e)
+        anyhow!(
+            "Failed to parse ACL config file '{}': {}",
+            path.display(),
+            e
+        )
     })?;
 
     Ok(config)
@@ -532,7 +553,11 @@ pub struct AclRouter {
 
 impl AclRouter {
     pub fn with_cache(engine: AclEngine, block_private_ip: bool, dns_cache: DnsCache) -> Self {
-        Self { engine, block_private_ip, dns_cache }
+        Self {
+            engine,
+            block_private_ip,
+            dns_cache,
+        }
     }
 }
 
@@ -576,7 +601,10 @@ impl AclRouter {
                 }
                 OutboundHandler::Reject(_) => crate::core::hooks::OutboundType::Reject,
             },
-            None => crate::core::hooks::OutboundType::Direct { resolved, handler: None },
+            None => crate::core::hooks::OutboundType::Direct {
+                resolved,
+                handler: None,
+            },
         }
     }
 }
@@ -618,7 +646,10 @@ acl:
             outbound_type: "direct".to_string(),
             socks5: None,
             http: None,
-            direct: Some(DirectConfig { mode: "auto".to_string(), ..Default::default() }),
+            direct: Some(DirectConfig {
+                mode: "auto".to_string(),
+                ..Default::default()
+            }),
         };
         let handler = OutboundHandler::from_entry(&entry).unwrap();
         assert!(matches!(handler, OutboundHandler::Direct(_)));
@@ -668,6 +699,9 @@ acl:
 
         let addr = Address::IPv4([8, 8, 8, 8], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, crate::core::hooks::OutboundType::Direct { .. }));
+        assert!(matches!(
+            result,
+            crate::core::hooks::OutboundType::Direct { .. }
+        ));
     }
 }

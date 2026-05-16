@@ -57,9 +57,9 @@ fn is_ipv6_unsupported(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[tokio::test]
     async fn test_dual_stack_accepts_ipv4() {

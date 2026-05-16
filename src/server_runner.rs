@@ -47,8 +47,11 @@ pub async fn build_router(
             "ACL router loaded"
         );
 
-        Ok(Arc::new(AclRouter::with_cache(engine, config.block_private_ip, dns_cache))
-            as Arc<dyn hooks::OutboundRouter>)
+        Ok(Arc::new(AclRouter::with_cache(
+            engine,
+            config.block_private_ip,
+            dns_cache,
+        )) as Arc<dyn hooks::OutboundRouter>)
     } else {
         log::info!(
             block_private_ip = config.block_private_ip,
@@ -186,7 +189,8 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                     Ok((req, respond)) => {
                         let server = Arc::clone(&server);
                         tokio::spawn(async move {
-                            if let Err(e) = process_request(&server, req, respond, peer_addr).await {
+                            if let Err(e) = process_request(&server, req, respond, peer_addr).await
+                            {
                                 log::debug!(peer = %peer_addr, error = %e, "Request error");
                             }
                         });
@@ -265,12 +269,11 @@ mod tests {
         let (_client_io, server_io) = duplex(1024);
         // _client_io is kept alive but never writes, so the server's H2 handshake stalls.
 
-        let result = timeout(
-            Duration::from_secs(10),
-            h2::server::handshake(server_io),
-        )
-        .await;
+        let result = timeout(Duration::from_secs(10), h2::server::handshake(server_io)).await;
 
-        assert!(result.is_err(), "H2 handshake must time out when client sends no preface");
+        assert!(
+            result.is_err(),
+            "H2 handshake must time out when client sends no preface"
+        );
     }
 }

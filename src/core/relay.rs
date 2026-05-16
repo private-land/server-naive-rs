@@ -315,7 +315,11 @@ mod tests {
     }
 
     impl AsyncWrite for NeverEofSink {
-        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
             Poll::Ready(Ok(buf.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -331,10 +335,10 @@ mod tests {
         let mut client = Cursor::new(b"hello".to_vec());
         let mut remote = NeverEofSink;
 
-        let result = copy_bidirectional_with_stats(
-            &mut client, &mut remote,
-            300, 1, 100, 1024, None,
-        ).await.unwrap();
+        let result =
+            copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1, 100, 1024, None)
+                .await
+                .unwrap();
 
         assert!(!result.completed);
         assert_eq!(result.termination, RelayTermination::HalfCloseTimeout);
@@ -345,10 +349,10 @@ mod tests {
         let mut client = NeverEofSink;
         let mut remote = NeverEofSink;
 
-        let result = copy_bidirectional_with_stats(
-            &mut client, &mut remote,
-            3, 100, 100, 1024, None,
-        ).await.unwrap();
+        let result =
+            copy_bidirectional_with_stats(&mut client, &mut remote, 3, 100, 100, 1024, None)
+                .await
+                .unwrap();
 
         assert_eq!(result.termination, RelayTermination::IdleTimeout);
     }
@@ -380,14 +384,28 @@ mod tests {
         let mut remote = Cursor::new(b"download".to_vec());
 
         let result = copy_bidirectional_with_stats(
-            &mut client, &mut remote,
-            300, 2, 5, 1024,
+            &mut client,
+            &mut remote,
+            300,
+            2,
+            5,
+            1024,
             Some((1, Arc::clone(&collector) as Arc<dyn StatsCollector>)),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(result.a_to_b > 0, "upload bytes should be counted");
         assert!(result.b_to_a > 0, "download bytes should be counted");
-        assert_eq!(collector.upload.load(Ordering::Relaxed), result.a_to_b, "recorded upload must match relay count");
-        assert_eq!(collector.download.load(Ordering::Relaxed), result.b_to_a, "recorded download must match relay count");
+        assert_eq!(
+            collector.upload.load(Ordering::Relaxed),
+            result.a_to_b,
+            "recorded upload must match relay count"
+        );
+        assert_eq!(
+            collector.download.load(Ordering::Relaxed),
+            result.b_to_a,
+            "recorded download must match relay count"
+        );
     }
 }

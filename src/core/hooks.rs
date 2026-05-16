@@ -38,9 +38,17 @@ pub enum OutboundType {
 impl std::fmt::Debug for OutboundType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutboundType::Direct { resolved: None, handler: None } => write!(f, "Direct"),
-            OutboundType::Direct { resolved: Some(addr), .. } => write!(f, "Direct({})", addr),
-            OutboundType::Direct { handler: Some(h), .. } => write!(f, "Direct({:?})", h),
+            OutboundType::Direct {
+                resolved: None,
+                handler: None,
+            } => write!(f, "Direct"),
+            OutboundType::Direct {
+                resolved: Some(addr),
+                ..
+            } => write!(f, "Direct({})", addr),
+            OutboundType::Direct {
+                handler: Some(h), ..
+            } => write!(f, "Direct({:?})", h),
             OutboundType::Reject => write!(f, "Reject"),
             OutboundType::Proxy(h) => write!(f, "Proxy({:?})", h),
         }
@@ -55,7 +63,10 @@ pub struct DirectRouter {
 
 impl DirectRouter {
     pub fn with_cache(block_private_ip: bool, dns_cache: DnsCache) -> Self {
-        Self { block_private_ip, dns_cache }
+        Self {
+            block_private_ip,
+            dns_cache,
+        }
     }
 }
 
@@ -68,9 +79,15 @@ impl OutboundRouter for DirectRouter {
             if is_private {
                 return OutboundType::Reject;
             }
-            return OutboundType::Direct { resolved, handler: None };
+            return OutboundType::Direct {
+                resolved,
+                handler: None,
+            };
         }
-        OutboundType::Direct { resolved: None, handler: None }
+        OutboundType::Direct {
+            resolved: None,
+            handler: None,
+        }
     }
 }
 
@@ -105,7 +122,10 @@ mod tests {
         let addr = Address::IPv4([8, 8, 8, 8], 80);
         assert!(matches!(
             router.route(&addr).await,
-            OutboundType::Direct { resolved: None, handler: None }
+            OutboundType::Direct {
+                resolved: None,
+                handler: None
+            }
         ));
     }
 
@@ -115,7 +135,10 @@ mod tests {
         let addr = Address::IPv4([127, 0, 0, 1], 80);
         assert!(matches!(
             router.route(&addr).await,
-            OutboundType::Direct { resolved: None, handler: None }
+            OutboundType::Direct {
+                resolved: None,
+                handler: None
+            }
         ));
     }
 
@@ -140,7 +163,10 @@ mod tests {
         let addr = Address::Domain("example.com".to_string(), 80);
         assert!(matches!(
             router.route(&addr).await,
-            OutboundType::Direct { resolved: Some(_), .. }
+            OutboundType::Direct {
+                resolved: Some(_),
+                ..
+            }
         ));
     }
 }

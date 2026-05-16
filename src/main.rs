@@ -18,6 +18,7 @@ mod logger;
 mod net;
 mod server_runner;
 mod transport;
+mod uot;
 
 // jemalloc: actively returns freed memory to OS, preventing RSS growth under high connection churn
 #[global_allocator]
@@ -91,8 +92,7 @@ async fn main() -> Result<()> {
     let dns_cache = dns_cache_rs::DnsCache::new();
 
     let router =
-        server_runner::build_router(&server_config, cli.refresh_geodata, dns_cache.clone())
-            .await?;
+        server_runner::build_router(&server_config, cli.refresh_geodata, dns_cache.clone()).await?;
 
     // Resolve max_connections once and log the result
     let resolved_max = config_auto::resolve(cli.max_connections);
