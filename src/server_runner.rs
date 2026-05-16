@@ -399,8 +399,8 @@ mod tests {
 
     #[test]
     fn test_h2_window_sizes_are_reasonable() {
-        assert!(super::H2_INITIAL_WINDOW_SIZE >= 64 * 1024);
-        assert!(super::H2_INITIAL_CONN_WINDOW_SIZE >= super::H2_INITIAL_WINDOW_SIZE);
+        const { assert!(super::H2_INITIAL_WINDOW_SIZE >= 64 * 1024) };
+        const { assert!(super::H2_INITIAL_CONN_WINDOW_SIZE >= super::H2_INITIAL_WINDOW_SIZE) };
     }
 
     /// Verify that a silent client (no H2 preface) is rejected within the request_timeout.

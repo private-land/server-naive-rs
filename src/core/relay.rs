@@ -35,7 +35,9 @@ pub struct CopyResult {
     #[allow(dead_code)]
     pub completed: bool,
     pub termination: RelayTermination,
+    #[allow(dead_code)]
     pub client_eof: bool,
+    #[allow(dead_code)]
     pub remote_eof: bool,
 }
 
