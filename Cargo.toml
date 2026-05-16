@@ -42,8 +42,8 @@ acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag
 dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0" }
 
 # Panel Integration (HTTP direct to v2board)
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.14" }
-panel-http = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.14" }
+panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
+panel-http = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
 
 [[bin]]
 name = "server-naive-agent"
@@ -53,7 +53,7 @@ path = "src/main.rs"
 tokio-test = "0.4"
 tempfile = "3.15"
 dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.14" }
+panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
 
 [profile.release]
 opt-level = 3
