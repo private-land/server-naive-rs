@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "server-naive-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
