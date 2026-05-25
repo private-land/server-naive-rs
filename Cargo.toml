@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [dependencies]
@@ -52,6 +52,9 @@ path = "src/main.rs"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.15"
+rcgen = "0.14"
+# expose ConnectionState trait so tests can read remote SETTINGS without a full h3 client loop
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
 panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
 
