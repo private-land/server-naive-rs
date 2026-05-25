@@ -78,6 +78,19 @@ const H2_INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 /// H2 initial connection-level flow-control window (2MB)
 const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
 
+/// Interval between H2 PING frames — keeps the connection alive through NAT/firewalls.
+const H2_KEEPALIVE_INTERVAL_SECS: u64 = 20;
+
+/// Time to wait for a PONG before treating the peer as dead and closing the connection.
+const H2_KEEPALIVE_TIMEOUT_SECS: u64 = 15;
+
+/// Interval between QUIC PING frames — prevents idle-timeout on the QUIC connection.
+const QUIC_KEEPALIVE_INTERVAL_SECS: u64 = 20;
+
+/// QUIC connection idle timeout: must be larger than keep-alive interval.
+/// Capped conservatively at 2 minutes to match typical NAT/middlebox limits.
+const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 120;
+
 /// Run the Naive server accept loop.
 pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Result<()> {
     use tokio::sync::Semaphore;
@@ -166,7 +179,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
 
             // HTTP/2 server handshake — timeout guards against clients that complete TLS
             // but never send the HTTP/2 preface, leaking a task per connection.
-            let mut h2_conn = match tokio::time::timeout(
+            let mut h2_conn: h2::server::Connection<_, bytes::Bytes> = match tokio::time::timeout(
                 server.conn_config.request_timeout,
                 h2::server::Builder::new()
                     .initial_window_size(H2_INITIAL_WINDOW_SIZE)
@@ -188,6 +201,30 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
 
             log::debug!(peer = %peer_addr, "H2 connection established");
 
+            // PING-based keep-alive: prevents NAT/firewall from silently dropping idle
+            // H2 connections.  PingPong shares internal state via Arc so it runs
+            // concurrently with h2_conn.accept(); accept() processes the PONG frames
+            // that wake the ping() future.
+            let keepalive_handle = h2_conn.ping_pong().map(|mut pinger| {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            H2_KEEPALIVE_INTERVAL_SECS,
+                        ))
+                        .await;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(H2_KEEPALIVE_TIMEOUT_SECS),
+                            pinger.ping(h2::Ping::opaque()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {} // PONG received — connection alive
+                            _ => break,     // timeout or error — peer is gone
+                        }
+                    }
+                })
+            });
+
             // Accept H2 streams (each stream is one CONNECT tunnel)
             while let Some(result) = h2_conn.accept().await {
                 match result {
@@ -208,6 +245,10 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                         break;
                     }
                 }
+            }
+
+            if let Some(handle) = keepalive_handle {
+                handle.abort();
             }
 
             log::debug!(peer = %peer_addr, "H2 connection closed");
@@ -235,7 +276,18 @@ pub async fn run_h3_server(server: Arc<Server>, config: &config::ServerConfig) -
     let tls_config = load_h3_tls_config(cert, key)?;
     let quinn_crypto = QuicServerConfig::try_from(tls_config)
         .map_err(|e| anyhow!("Failed to build Quinn TLS config: {}", e))?;
-    let quinn_server = quinn::ServerConfig::with_crypto(Arc::new(quinn_crypto));
+
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+        QUIC_KEEPALIVE_INTERVAL_SECS,
+    )));
+    transport_config.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(QUIC_MAX_IDLE_TIMEOUT_SECS))
+            .expect("QUIC idle timeout value is valid"),
+    ));
+
+    let mut quinn_server = quinn::ServerConfig::with_crypto(Arc::new(quinn_crypto));
+    quinn_server.transport_config(Arc::new(transport_config));
 
     // Try IPv6 dual-stack first, fall back to IPv4-only.
     let addr_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.port);
