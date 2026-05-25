@@ -633,5 +633,136 @@ mod tests {
             );
             server.abort();
         }
+
+        /// GREEN: end-to-end regression for the multi-thread speedtest upload bug.
+        ///
+        /// The bug: without `enable_extended_connect(true)`, the server sends
+        /// `SETTINGS_ENABLE_CONNECT_PROTOCOL = 0`.  Sing-box (naive outbound,
+        /// `quic: true`) opens stream 1 before the SETTINGS frame arrives (succeeds),
+        /// then reads the server's SETTINGS and sees CONNECT is forbidden — so it
+        /// refuses to open streams 2..N.  Multi-thread upload stalls; single-thread
+        /// appears fine because only one stream is ever needed.
+        ///
+        /// This test opens N CONNECT streams **after** the client has processed the
+        /// server's SETTINGS frame (simulating the steady-state of a multi-thread
+        /// speedtest).  All N streams must open, deliver their full upload payload,
+        /// and have their byte counts confirmed on the server side.
+        #[tokio::test]
+        async fn green_multi_stream_upload_all_streams_complete() {
+            use bytes::Buf as _;
+            use std::sync::Mutex;
+
+            install_crypto();
+            let (cert, key) = gen_certs();
+            let (ep, port) = server_endpoint(cert.clone(), key);
+
+            const N: usize = 4;
+            const PAYLOAD: &[u8] = b"multi-thread speedtest upload payload";
+
+            let totals = Arc::new(Mutex::new(vec![0usize; N]));
+            let totals_srv = Arc::clone(&totals);
+
+            // ── Server: accept N CONNECT streams, send 200, count upload bytes ─
+            let server = tokio::spawn(async move {
+                let quic = ep.accept().await.unwrap().await.unwrap();
+                let mut h3 = h3::server::builder()
+                    .enable_extended_connect(true)
+                    .build::<_, Bytes>(H3Conn::new(quic))
+                    .await
+                    .unwrap();
+
+                let mut handles = Vec::with_capacity(N);
+                for i in 0..N {
+                    let resolver = h3.accept().await.unwrap().unwrap();
+                    let totals = Arc::clone(&totals_srv);
+                    handles.push(tokio::spawn(async move {
+                        let (_req, mut stream) = resolver.resolve_request().await.unwrap();
+                        stream
+                            .send_response(http::Response::builder().status(200).body(()).unwrap())
+                            .await
+                            .unwrap();
+                        let mut n = 0usize;
+                        while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                            n += chunk.remaining();
+                            chunk.advance(chunk.remaining());
+                        }
+                        totals.lock().unwrap()[i] = n;
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            });
+
+            // ── Client: open N CONNECT streams after SETTINGS, upload payload ──
+            let (mut driver, mut send_req) = h3::client::new(client_conn(cert, port).await)
+                .await
+                .unwrap();
+
+            // Wait for SETTINGS so the client treats all N CONNECT requests as valid.
+            drive(&mut driver, Duration::from_millis(150)).await;
+            assert!(
+                send_req.settings().enable_extended_connect(),
+                "prerequisite: SETTINGS_ENABLE_CONNECT_PROTOCOL=1 must be advertised"
+            );
+
+            // Open N CONNECT streams — all after SETTINGS, all must be accepted.
+            // send_request opens a QUIC stream and queues the HEADERS frame; it
+            // does not need a response to complete.
+            let mut req_streams = Vec::with_capacity(N);
+            for _ in 0..N {
+                let req = http::Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri("example.com:80")
+                    .body(())
+                    .unwrap();
+                req_streams.push(send_req.send_request(req).await.unwrap());
+            }
+
+            // Drive to deliver all N HEADERS frames to the server.
+            drive(&mut driver, Duration::from_millis(100)).await;
+
+            // For each stream: receive 200, send upload payload, signal EOS.
+            for mut stream in req_streams {
+                // Drive the connection concurrently while waiting for the 200 response.
+                let status = tokio::select! {
+                    r = stream.recv_response() => r.unwrap().status(),
+                    _ = drive(&mut driver, Duration::from_millis(500)) => {
+                        panic!("timed out waiting for 200 on a CONNECT stream");
+                    }
+                };
+                assert_eq!(status, 200, "every CONNECT stream must be accepted");
+
+                // send_data queues a DATA frame; drive concurrently to flush.
+                tokio::select! {
+                    r = stream.send_data(Bytes::copy_from_slice(PAYLOAD)) => r.unwrap(),
+                    _ = drive(&mut driver, Duration::from_millis(200)) => {}
+                }
+
+                // finish() sends the END_STREAM signal so the server's recv_data
+                // loop returns None.  Drive concurrently to flush the frame.
+                tokio::select! {
+                    r = stream.finish() => r.unwrap(),
+                    _ = drive(&mut driver, Duration::from_millis(200)) => {}
+                }
+            }
+
+            // Final drive to ensure all DATA frames reach the server.
+            drive(&mut driver, Duration::from_millis(300)).await;
+
+            server
+                .await
+                .expect("server task must complete without error");
+
+            let counts = totals.lock().unwrap();
+            for (i, &count) in counts.iter().enumerate() {
+                assert_eq!(
+                    count,
+                    PAYLOAD.len(),
+                    "stream {i}: expected {} upload bytes, got {count}",
+                    PAYLOAD.len()
+                );
+            }
+        }
     }
 }
