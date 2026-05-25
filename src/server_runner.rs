@@ -354,10 +354,13 @@ pub async fn run_h3_server(server: Arc<Server>, config: &config::ServerConfig) -
 
             log::debug!(peer = %peer_addr, "QUIC connection established");
 
-            // Upgrade to HTTP/3.
+            // Upgrade to HTTP/3. enable_extended_connect advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+            // (RFC 8441); without it, strict clients refuse to send CONNECT requests.
             let mut h3_conn = match tokio::time::timeout(
                 server.conn_config.request_timeout,
-                h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(quic_conn)),
+                h3::server::builder()
+                    .enable_extended_connect(true)
+                    .build::<_, Bytes>(h3_quinn::Connection::new(quic_conn)),
             )
             .await
             {
@@ -473,5 +476,162 @@ mod tests {
             result.is_err(),
             "H2 handshake must time out when client sends no preface"
         );
+    }
+
+    // ── H3 SETTINGS_ENABLE_CONNECT_PROTOCOL tests ─────────────────────────────
+    //
+    // The naive proxy protocol requires HTTP CONNECT tunneling (RFC 8441 extended CONNECT).
+    // RFC 8441 §3: a server MUST advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 before clients
+    // may use the CONNECT method.  Sing-box's naive outbound (quic:true) checks this setting
+    // before opening each stream: the FIRST stream is opened before SETTINGS arrive (succeeds),
+    // but streams 2..N — opened after the client has processed the server's SETTINGS — fail
+    // when the flag is absent.  This is why single-thread worked but multi-thread did not.
+    mod h3_extended_connect {
+        use bytes::Bytes;
+        use h3::ConnectionState as _;
+        use h3_quinn::Connection as H3Conn;
+        use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use std::net::{Ipv6Addr, ToSocketAddrs};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn install_crypto() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            });
+        }
+
+        fn gen_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            (
+                cert.into(),
+                PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+            )
+        }
+
+        fn server_endpoint(
+            cert: CertificateDer<'static>,
+            key: PrivateKeyDer<'static>,
+        ) -> (quinn::Endpoint, u16) {
+            let mut tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+            tls.max_early_data_size = u32::MAX;
+            tls.alpn_protocols = vec![b"h3".to_vec()];
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_idle_timeout(Some(
+                quinn::IdleTimeout::try_from(Duration::from_secs(5)).unwrap(),
+            ));
+            let mut sc = quinn::ServerConfig::with_crypto(Arc::new(
+                QuicServerConfig::try_from(tls).unwrap(),
+            ));
+            sc.transport_config(Arc::new(transport));
+            let ep = quinn::Endpoint::server(sc, "[::1]:0".parse().unwrap()).unwrap();
+            let port = ep.local_addr().unwrap().port();
+            (ep, port)
+        }
+
+        async fn client_conn(cert: CertificateDer<'static>, port: u16) -> H3Conn {
+            let addr = (Ipv6Addr::LOCALHOST, port)
+                .to_socket_addrs()
+                .unwrap()
+                .next()
+                .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let mut tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tls.enable_early_data = true;
+            tls.alpn_protocols = vec![b"h3".to_vec()];
+            let cc = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+            let mut ep = quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
+            ep.set_default_client_config(cc);
+            H3Conn::new(ep.connect(addr, "localhost").unwrap().await.unwrap())
+        }
+
+        /// Drive the h3 client connection for up to `budget` to let it process
+        /// incoming SETTINGS and other control frames from the server.
+        async fn drive(driver: &mut h3::client::Connection<H3Conn, Bytes>, budget: Duration) {
+            tokio::select! {
+                _ = tokio::time::sleep(budget) => {}
+                _ = std::future::poll_fn(|cx| driver.poll_close(cx)) => {}
+            }
+        }
+
+        /// RED — Documents the pre-fix behavior: `h3::server::Connection::new()` uses
+        /// default settings where `enable_extended_connect = false`, so the server sends
+        /// `SETTINGS_ENABLE_CONNECT_PROTOCOL = 0`.
+        ///
+        /// Consequence: a strict client (sing-box naive outbound) accepts the first CONNECT
+        /// stream (opened before the SETTINGS frame arrives), but refuses all subsequent
+        /// streams once it has processed the server's SETTINGS — breaking multi-thread tests.
+        #[tokio::test]
+        async fn red_connection_new_sends_zero_enable_connect_protocol() {
+            install_crypto();
+            let (cert, key) = gen_certs();
+            let (ep, port) = server_endpoint(cert.clone(), key);
+
+            let server = tokio::spawn(async move {
+                let quic = ep.accept().await.unwrap().await.unwrap();
+                // Pre-fix code path: Connection::new() with default (broken) settings.
+                let _h3 = h3::server::Connection::<_, Bytes>::new(H3Conn::new(quic))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+
+            let (mut driver, send_req) = h3::client::new(client_conn(cert, port).await)
+                .await
+                .unwrap();
+            drive(&mut driver, Duration::from_millis(150)).await;
+
+            // This asserts the bug: the flag is NOT set, so streams 2..N would be refused.
+            assert!(
+                !send_req.settings().enable_extended_connect(),
+                "Connection::new() must NOT advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 \
+                 (this is the bug that broke multi-thread speed tests)"
+            );
+            server.abort();
+        }
+
+        /// GREEN — Validates the fix: `h3::server::builder().enable_extended_connect(true)`
+        /// sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`.
+        ///
+        /// With this setting present, sing-box's naive outbound allows CONNECT on every stream
+        /// it opens — fixing both single-thread and multi-thread speed tests.
+        #[tokio::test]
+        async fn green_builder_enable_extended_connect_sends_one() {
+            install_crypto();
+            let (cert, key) = gen_certs();
+            let (ep, port) = server_endpoint(cert.clone(), key);
+
+            let server = tokio::spawn(async move {
+                let quic = ep.accept().await.unwrap().await.unwrap();
+                // Post-fix code path: builder with enable_extended_connect(true).
+                let _h3 = h3::server::builder()
+                    .enable_extended_connect(true)
+                    .build::<_, Bytes>(H3Conn::new(quic))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+
+            let (mut driver, send_req) = h3::client::new(client_conn(cert, port).await)
+                .await
+                .unwrap();
+            drive(&mut driver, Duration::from_millis(150)).await;
+
+            assert!(
+                send_req.settings().enable_extended_connect(),
+                "builder with enable_extended_connect(true) MUST advertise \
+                 SETTINGS_ENABLE_CONNECT_PROTOCOL=1"
+            );
+            server.abort();
+        }
     }
 }
