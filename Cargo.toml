@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -36,14 +36,14 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
 # ACL Engine (remote)
-acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
+acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
 
 # DNS resolution cache
-dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0" }
+dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0" }
 
 # Panel Integration (Connect-RPC via QUIC/H3)
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
-panel-connect-rpc = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.15" }
+panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.15" }
 
 [[bin]]
 name = "server-naive-agent"
@@ -52,8 +52,8 @@ path = "src/main.rs"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.15"
-dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
+dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.15" }
 
 [profile.release]
 opt-level = 3
