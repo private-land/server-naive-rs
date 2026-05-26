@@ -519,9 +519,7 @@ mod tests {
                 // the task stays alive until the connection closes naturally, giving
                 // the bridge's download task time to deliver all data before
                 // CONNECTION_CLOSE is sent.
-                tokio::spawn(async move {
-                    while let Ok(Some(_)) = h3conn.accept().await {}
-                });
+                tokio::spawn(async move { while let Ok(Some(_)) = h3conn.accept().await {} });
 
                 let (_req, mut stream) = resolver.resolve_request().await.unwrap();
                 stream
