@@ -142,30 +142,31 @@ impl<T: AsyncRead + Unpin> AsyncRead for NaivePaddedTransport<T> {
                 if buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
                 }
-                if buf.remaining() >= this.read_data_rem {
-                    // Caller's buffer is larger — must limit to avoid consuming
+                let n = if buf.remaining() > this.read_data_rem {
+                    // Caller's buffer is larger — limit to avoid consuming
                     // the next frame's header/padding bytes.
-                    let chunk = this.read_data_rem.min(4096);
-                    let mut scratch = [0u8; 4096];
-                    let mut sbuf = ReadBuf::new(&mut scratch[..chunk]);
-                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut sbuf))?;
-                    let n = sbuf.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Ok(())); // EOF
+                    // buf.take() shares the parent buffer's memory: zero-copy, no size cap.
+                    // Mirrors the pattern in tokio's own Take::poll_read.
+                    let mut limited = buf.take(this.read_data_rem);
+                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut limited))?;
+                    let n = limited.filled().len();
+                    if n > 0 {
+                        // Safety: `limited` was backed by the unfilled portion of `buf`;
+                        // those `n` bytes were written there and are now initialised.
+                        unsafe { buf.assume_init(n) };
+                        buf.advance(n);
                     }
-                    buf.put_slice(&scratch[..n]);
-                    this.read_data_rem -= n;
+                    n
                 } else {
-                    // Caller's buffer is smaller — safe to read directly (won't
-                    // overshoot the frame boundary).
+                    // buf.remaining() <= read_data_rem: can't overshoot the frame boundary.
                     let before = buf.filled().len();
                     ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
-                    let n = buf.filled().len() - before;
-                    if n == 0 {
-                        return Poll::Ready(Ok(())); // EOF
-                    }
-                    this.read_data_rem -= n;
+                    buf.filled().len() - before
+                };
+                if n == 0 {
+                    return Poll::Ready(Ok(())); // EOF
                 }
+                this.read_data_rem -= n;
                 if this.read_data_rem == 0 {
                     this.read_skip_rem = this.read_pending_skip;
                     this.read_pending_skip = 0;
@@ -659,5 +660,138 @@ mod tests {
         let mut expected = frame1.to_vec();
         expected.extend_from_slice(frame2);
         assert_eq!(decoded, expected);
+    }
+
+    // ── Phase 1 scratch-buffer regression tests ───────────────────────────────
+
+    /// RED → GREEN: Phase 1 must deliver the entire frame in a single poll_read
+    /// when the caller's buffer is large enough.
+    ///
+    /// BUG (scratch buffer): poll_read limited each read to
+    ///   `min(read_data_rem, 4096)` bytes.  For a 32 KB frame with a 64 KB
+    ///   caller buffer, only 4096 bytes were returned per call.
+    ///
+    /// FIX (buf.take): reads up to `read_data_rem` bytes directly into the
+    ///   caller's buffer — all 32 KB in one call.
+    ///
+    /// Assertion: a single `read` on a pre-filled 32 KB frame returns > 4096 bytes.
+    #[tokio::test]
+    async fn red_phase1_large_frame_not_capped_at_4096() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const DATA_SIZE: usize = 32 * 1024; // 32 KB > 4096
+
+        // Build one raw padded frame manually: [u16 BE data_len][u8 pad=0][data]
+        let mut frame = Vec::with_capacity(3 + DATA_SIZE);
+        frame.extend_from_slice(&(DATA_SIZE as u16).to_be_bytes());
+        frame.push(0u8);
+        frame.extend(std::iter::repeat_n(0xABu8, DATA_SIZE));
+
+        // 1 MB pipe ensures all frame bytes are available before first read.
+        let (tx, rx) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            let mut w = tx;
+            w.write_all(&frame).await.unwrap();
+            w.shutdown().await.unwrap();
+        });
+
+        let mut dec = NaivePaddedTransport::new(rx);
+
+        // Buffer is LARGER than the frame so poll_read hits the "limit" branch.
+        let mut buf = vec![0u8; DATA_SIZE * 2];
+        let n = dec.read(&mut buf).await.unwrap();
+
+        // BUG: old code returns exactly 4096 bytes; fix returns the full 32 KB.
+        assert!(
+            n > 4096,
+            "poll_read must return more than 4096 bytes from a 32 KB frame \
+             in one call (old scratch-buffer bug returned exactly 4096); got {n}"
+        );
+    }
+
+    /// RED → GREEN: total inner poll_read calls to consume one 32 KB frame
+    /// must be far fewer with the fix than with the scratch-buffer bug.
+    ///
+    /// BUG: scratch buffer caps each Phase 1 read at 4 096 bytes.
+    ///   To consume 32 768 bytes of frame data: ⌈32768/4096⌉ = 8 data reads.
+    ///   Plus 1 header read + 1 initial Pending = 10 inner reads total.
+    ///
+    /// FIX (buf.take): one Phase 1 read delivers the entire 32 KB frame.
+    ///   1 header read + 1 data read + 1 initial Pending = 3 inner reads total.
+    ///
+    /// Threshold: ≤ 4 inner reads separates fix (3) from bug (10).
+    #[tokio::test]
+    async fn red_phase1_large_frame_inner_read_count() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncReadExt, ReadBuf};
+
+        struct CountingReader<R> {
+            inner: R,
+            calls: std::sync::Arc<AtomicUsize>,
+        }
+        impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingReader<R> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        const DATA_SIZE: usize = 32 * 1024;
+
+        let mut frame = Vec::with_capacity(3 + DATA_SIZE);
+        frame.extend_from_slice(&(DATA_SIZE as u16).to_be_bytes());
+        frame.push(0u8);
+        frame.extend(std::iter::repeat_n(0xCDu8, DATA_SIZE));
+
+        let (tx, rx) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            let mut w = tx;
+            tokio::io::AsyncWriteExt::write_all(&mut w, &frame)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::shutdown(&mut w).await.unwrap();
+        });
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader {
+            inner: rx,
+            calls: calls.clone(),
+        };
+        let mut dec = NaivePaddedTransport::new(counting);
+        let mut buf = vec![0u8; DATA_SIZE * 2];
+
+        // Consume the full frame, accumulating inner-read counts across all outer reads.
+        let mut total_consumed = 0usize;
+        loop {
+            let n = dec.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total_consumed += n;
+            if total_consumed >= DATA_SIZE {
+                break;
+            }
+        }
+        let total_inner_reads = calls.load(Ordering::SeqCst);
+
+        assert_eq!(
+            total_consumed, DATA_SIZE,
+            "must consume exactly {DATA_SIZE} bytes"
+        );
+
+        // Fix: 1 Pending + 1 header + 1 data = 3 inner reads.
+        // Bug: 1 Pending + 1 header + 8 data = 10 inner reads.
+        // Threshold 5 clearly separates fix (≤4) from bug (≥10).
+        assert!(
+            total_inner_reads <= 5,
+            "total inner reads to consume {DATA_SIZE} bytes should be ≤5 with fix \
+             (old scratch-buffer bug needed ≥10); got {total_inner_reads}"
+        );
     }
 }

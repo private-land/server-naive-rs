@@ -237,6 +237,7 @@ where
 
     // ── Input loop: H2 → UDP ──────────────────────────────────────────────────
     let input = async move {
+        let mut payload_buf = vec![0u8; 65535];
         'read: loop {
             let next = async {
                 let dest: Option<SocketAddr> = if is_connect {
@@ -250,13 +251,13 @@ where
                 if len == 0 {
                     return Ok::<_, anyhow::Error>(());
                 }
-                let mut payload = vec![0u8; len];
-                h2_reader.read_exact(&mut payload).await?;
+                h2_reader.read_exact(&mut payload_buf[..len]).await?;
+                let payload = &payload_buf[..len];
 
                 let sent = if is_connect {
-                    udp_send.send(&payload).await?
+                    udp_send.send(payload).await?
                 } else {
-                    udp_send.send_to(&payload, dest.unwrap()).await?
+                    udp_send.send_to(payload, dest.unwrap()).await?
                 };
                 stats_in.record_upload(user_id, sent as u64);
                 Ok(())
