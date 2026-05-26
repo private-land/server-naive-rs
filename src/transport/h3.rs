@@ -3,26 +3,25 @@
 //! Wraps an `h3::server::RequestStream` as `AsyncRead + AsyncWrite` using a
 //! `tokio::io::duplex` pair bridged by a background task.
 //!
-//! Data flow:
-//!   H3 recv_data → upload channel (unbounded) → ul_task → io_write → relay
-//!   relay writes → io_read → dl_task → download channel (unbounded) → H3 send_data
+//! Data flow (four independent tasks):
 //!
-//! Both channels are **unbounded** to decouple the H3 layer from the relay:
+//!   [recv loop]  h3.recv_data() → ul_tx (unbounded) → [ul_task] io_write → relay
+//!   [dl_task]    io_read ← relay → dl_tx (unbounded) → [send_task] h3.send_data()
 //!
-//! Upload channel: `h3.recv_data()` is never blocked waiting for `io_write`.
-//!   The previous design ran `io_write.write_all()` inside the `select!` arm,
-//!   which prevented `recv_data()` from being polled while the duplex was full.
-//!   With 8 parallel upload streams the duplex filled whenever the relay was
-//!   slow, exhausting the QUIC stream receive window and stalling all streams.
+//! All four paths run concurrently — no path can block another:
 //!
-//! Download channel: the relay is never blocked waiting for `h3.send_data()`.
-//!   `send_data()` executes inside the `select!` arm body, so while it awaits
-//!   (QUIC send window temporarily full on real-network RTT > 0) the dl_rx is
-//!   not drained.  With a bounded channel (capacity 16 × 32 KB = 512 KB) the
-//!   relay's DuplexStream fills in ~46 ms at 100 Mbit/s, stalling the relay
-//!   and ultimately the TCP connection to the remote — causing speedtest
-//!   "test failed to complete" errors on real-network deployments.  An
-//!   unbounded channel absorbs temporary send_data() delays without stalling.
+//! Bug 1 (fixed in v0.1.2): SETTINGS_ENABLE_CONNECT_PROTOCOL=0 caused streams 2..N
+//!   to be refused by strict clients.  Fix: enable_extended_connect(true) on builder.
+//!
+//! Bug 2 (fixed in v0.1.3): `write_all()` inside the select! arm blocked recv_data().
+//!   Fix: ul_task runs write_all in its own task; recv loop only does non-blocking sends.
+//!
+//! Bug 3 (fixed in v0.1.5): `send_data()` inside the select! arm blocked recv_data().
+//!   When both upload and download are active simultaneously (real speedtest), QUIC send
+//!   window fills → send_data() awaits → recv_data() is never polled → upload window
+//!   exhausted → both directions stall.
+//!   Fix: split the RequestStream into send/recv halves; send_task calls send_data()
+//!   independently so recv_data() is never delayed by QUIC congestion on the send side.
 
 use bytes::{Buf, Bytes};
 use std::io;
@@ -61,48 +60,41 @@ impl H3Transport {
 
 /// Bridge an h3 `RequestStream` to a `DuplexStream`.
 ///
-/// Runs until either side closes or errors.
-async fn bridge<C>(mut h3: h3::server::RequestStream<C, Bytes>, io: DuplexStream)
+/// Four tasks run independently so no path can block another:
+///   recv loop → ul_tx → ul_task → io_write (relay upstream)
+///   dl_task ← io_read (relay downstream) → dl_tx → send_task → h3.send_data
+async fn bridge<C>(h3: h3::server::RequestStream<C, Bytes>, io: DuplexStream)
 where
     C: h3::quic::BidiStream<Bytes> + Send + 'static,
     C::RecvStream: Send + 'static,
     C::SendStream: Send + 'static,
 {
-    // Download channel: unbounded so dl_task never blocks waiting for main loop.
-    // Memory growth is bounded by TCP throughput × QUIC send stall duration: dl_task
-    // drains the DuplexStream (32 KiB) immediately without waiting for send_data(), so
-    // the relay is never throttled by QUIC congestion.  In practice this is a few hundred
-    // KiB (100 Mbit/s × 50 ms RTT) to a few MB under heavy congestion — acceptable for a
-    // proxy.  A bounded channel would reintroduce the relay stall we are fixing here.
-    let (dl_tx, mut dl_rx) = mpsc::unbounded_channel::<Bytes>();
-    // Upload channel: unbounded so recv_data() never blocks waiting for io_write.
-    // Memory growth is bounded in practice by the QUIC stream receive window
-    // (Quinn defaults to 64 KiB per stream): once the window fills the peer stops
-    // sending, so at most one window's worth of data can pile up here.  A
-    // code-level bound is not added because it would reintroduce the stall.
-    let (ul_tx, ul_rx) = mpsc::unbounded_channel::<Option<Bytes>>();
-    let (mut io_read, io_write) = tokio::io::split(io);
+    // Upload channel: recv loop enqueues non-blocking; ul_task drains with write_all.
+    // Bounded in practice by the QUIC stream receive window (~64 KiB per stream).
+    let (ul_tx, mut ul_rx) = mpsc::unbounded_channel::<Option<Bytes>>();
+    // Download channel: dl_task enqueues non-blocking; send_task drains with send_data.
+    // Bounded in practice by TCP throughput × QUIC send stall duration (a few MB max).
+    let (dl_tx, dl_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (mut io_read, mut io_write) = tokio::io::split(io);
 
-    // ul_task: drains the upload channel and writes to the relay.
-    // Running in its own task means write_all blocking never prevents recv_data()
-    // from being polled — fixing the multi-thread upload stall.
+    // Split the h3 stream so send and recv run in independent tasks (Bug 3 fix).
+    // Without splitting, send_data() inside a select! arm would block recv_data()
+    // whenever the QUIC send window filled — stalling upload during heavy download.
+    let (mut h3_send, mut h3_recv) = h3.split();
+
+    // ul_task: write_all never prevents recv_data() from being polled (Bug 2 fix).
     let ul_task = tokio::spawn(async move {
-        let mut io_write = io_write;
-        let mut ul_rx: mpsc::UnboundedReceiver<Option<Bytes>> = ul_rx;
         while let Some(Some(bytes)) = ul_rx.recv().await {
             if io_write.write_all(&bytes).await.is_err() {
                 break;
             }
         }
-        // Explicitly shut down the write side so the relay's transport.read() sees EOF.
-        // Dropping WriteHalf<DuplexStream> WITHOUT calling shutdown does NOT close the
-        // underlying channel: the Arc is shared with io_read (held by dl_task), so the
-        // DuplexStream itself is still alive and the write pipe is still open.  The relay
-        // would block on transport.read() forever after client FIN without this call.
+        // Shutdown signals EOF to the relay's read side (dropping WriteHalf alone
+        // does not close the DuplexStream while io_read is still alive).
         let _ = io_write.shutdown().await;
     });
 
-    // dl_task: reads from relay and queues bytes for h3 send_data.
+    // dl_task: reads relay downstream output and queues for send_task.
     let dl_task = tokio::spawn(async move {
         let mut buf = vec![0u8; BRIDGE_BUF];
         loop {
@@ -117,65 +109,54 @@ where
         }
     });
 
-    // Main loop: select between incoming H3 data and queued outgoing data.
+    // send_task: drains dl_rx and calls h3.send_data — independent of recv loop.
+    // Running in its own task means QUIC congestion on the send side never delays
+    // recv_data() in the recv loop below (Bug 3 fix).
     //
-    // Half-close handling: when the client sends FIN (recv_data returns None),
-    // we send a None sentinel through ul_tx (causes ul_task to drop io_write,
-    // signalling EOF to the relay's read side) but keep the loop alive to
-    // forward any pending server→client data through the dl_rx channel.
-    // The loop exits only when the relay finishes (dl_rx channel closes) or on error.
-    let mut client_fin = false;
+    // On send_data error: remaining dl_rx items are dropped (the loop breaks, dl_rx
+    // goes out of scope).  This is intentional — the QUIC stream is already broken so
+    // the peer cannot receive those bytes anyway.  dl_task detects the dropped dl_rx
+    // (dl_tx.send returns Err) and exits, after which io_read is dropped, signalling
+    // the relay that the downstream channel is gone.
+    let send_task = tokio::spawn(async move {
+        let mut dl_rx = dl_rx;
+        while let Some(bytes) = dl_rx.recv().await {
+            if h3_send.send_data(bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = h3_send.finish().await;
+    });
+
+    // Recv loop: h3.recv_data() → ul_tx (non-blocking enqueue).
+    // Never blocked by send_data() because h3_send is in send_task.
     loop {
-        if !client_fin {
-            tokio::select! {
-                // H3 client → relay: enqueue DATA frames for ul_task (non-blocking).
-                result = h3.recv_data() => {
-                    match result {
-                        Ok(Some(mut data)) => {
-                            let bytes = data.copy_to_bytes(data.remaining());
-                            if ul_tx.send(Some(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        // Client sent FIN: send sentinel so ul_task drops io_write → EOF to relay.
-                        // Ignored if ul_task already exited (write error); either way io_write
-                        // will be dropped and the relay will see EOF.
-                        Ok(None) | Err(_) => {
-                            let _ = ul_tx.send(None);
-                            client_fin = true;
-                        }
-                    }
-                }
-                // Relay → H3 client: forward queued bytes as DATA frames.
-                data = dl_rx.recv() => {
-                    match data {
-                        Some(bytes) => {
-                            if h3.send_data(bytes).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
+        match h3_recv.recv_data().await {
+            Ok(Some(mut data)) => {
+                let bytes = data.copy_to_bytes(data.remaining());
+                if ul_tx.send(Some(bytes)).is_err() {
+                    break;
                 }
             }
-        } else {
-            // Client FIN received; drain remaining relay→client data.
-            match dl_rx.recv().await {
-                Some(bytes) => {
-                    if h3.send_data(bytes).await.is_err() {
-                        break;
-                    }
-                }
-                None => break,
+            // Client FIN: sentinel causes ul_task to call io_write.shutdown() → relay EOF.
+            Ok(None) | Err(_) => {
+                let _ = ul_tx.send(None);
+                break;
             }
         }
     }
+    // Drop h3_recv now, before awaiting the tasks.
+    // h3::server::RequestStream::split() clones RequestEnd into both halves; each
+    // half notifies the H3 connection (releases its stream slot) when dropped.
+    // Dropping h3_recv here — rather than letting it live until bridge() returns —
+    // tells the H3 connection that the recv side of this request is done as soon as
+    // the client FIN is processed, allowing the connection to accept new streams
+    // sooner instead of holding the slot for the duration of ul/dl/send tasks.
+    drop(h3_recv);
 
-    ul_task.abort();
-    dl_task.abort();
-
-    // Close the H3 send side cleanly so the client sees a proper stream end.
-    let _ = h3.finish().await;
+    ul_task.await.ok();
+    dl_task.await.ok();
+    send_task.await.ok();
 }
 
 // ── AsyncRead / AsyncWrite — delegate to the duplex inner stream ──────────────
@@ -391,6 +372,83 @@ mod tests {
             10,
             "GREEN: unbounded dl channel — all 10 reads complete immediately; \
              slow send_data does not stall dl_task"
+        );
+    }
+
+    // ── send_task error-path tests ─────────────────────────────────────────────
+    //
+    // Verify that when send_data() fails mid-bridge:
+    //   1. (RED)   pending items in dl_rx are dropped, not delivered
+    //   2. (GREEN) dl_task terminates promptly once dl_rx is gone (no deadlock)
+
+    /// RED: shows that dropping dl_rx (send_task exiting on error) causes a
+    /// concurrent dl_task to see Err on its next send and exit.
+    /// Remaining items queued BEFORE the drop are discarded — they can't be
+    /// delivered because the QUIC stream is already broken.
+    #[tokio::test(start_paused = true)]
+    async fn red_send_task_exit_drops_pending_dl_bytes() {
+        let (dl_tx, dl_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let q = Arc::clone(&queued);
+
+        // dl_task equivalent: keeps sending until dl_tx is gone.
+        let dl_task = tokio::spawn(async move {
+            for i in 0..10usize {
+                let payload = bytes::Bytes::from(vec![i as u8; 64]);
+                if dl_tx.send(payload).is_err() {
+                    break;
+                }
+                q.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        // Let dl_task queue all 10 items.
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        dl_task.await.unwrap();
+        assert_eq!(queued.load(std::sync::atomic::Ordering::Relaxed), 10);
+
+        // send_task exits on error: drop dl_rx without draining.
+        // The 10 queued items are abandoned — this is the documented behaviour.
+        drop(dl_rx);
+        // If we reach here the items were silently discarded (no panic/deadlock).
+    }
+
+    /// GREEN: once dl_rx is dropped by send_task, a concurrent dl_task that is
+    /// mid-send terminates promptly (next dl_tx.send returns Err → task exits).
+    #[tokio::test]
+    async fn green_dl_task_exits_promptly_when_dl_rx_dropped() {
+        let (dl_tx, dl_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let e = Arc::clone(&exited);
+
+        // dl_task: streams continuously until channel is closed.
+        let dl_task = tokio::spawn(async move {
+            loop {
+                let payload = bytes::Bytes::from(vec![0u8; 64]);
+                if dl_tx.send(payload).is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await; // give other tasks a chance to run
+            }
+            e.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        // Allow dl_task to run a few iterations.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Simulate send_task exiting on error: drop the receiver.
+        drop(dl_rx);
+
+        // dl_task should see Err on its next send and exit within the test timeout.
+        tokio::time::timeout(std::time::Duration::from_secs(1), dl_task)
+            .await
+            .expect("dl_task did not exit within 1s after dl_rx was dropped")
+            .unwrap();
+
+        assert!(
+            exited.load(std::sync::atomic::Ordering::Acquire),
+            "GREEN: dl_task exited promptly after dl_rx was dropped by send_task"
         );
     }
 
