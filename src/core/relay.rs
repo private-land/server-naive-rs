@@ -48,7 +48,6 @@ struct DirectionalBuffer {
     amt: u64,
     read_done: bool,
     shutdown_done: bool,
-    flush_ok: bool,
 }
 
 impl DirectionalBuffer {
@@ -60,7 +59,6 @@ impl DirectionalBuffer {
             amt: 0,
             read_done: false,
             shutdown_done: false,
-            flush_ok: false,
         }
     }
 
@@ -79,11 +77,6 @@ impl DirectionalBuffer {
         self.amt
     }
 
-    #[inline]
-    fn has_flushed(&self) -> bool {
-        self.flush_ok
-    }
-
     fn poll_copy<R: AsyncRead, W: AsyncWrite>(
         &mut self,
         cx: &mut Context<'_>,
@@ -93,8 +86,6 @@ impl DirectionalBuffer {
         if self.shutdown_done {
             return Poll::Ready(Ok(()));
         }
-
-        self.flush_ok = false;
 
         loop {
             while self.pos < self.cap {
@@ -137,9 +128,7 @@ impl DirectionalBuffer {
             }
 
             match writer.as_mut().poll_flush(cx) {
-                Poll::Ready(Ok(())) => {
-                    self.flush_ok = true;
-                }
+                Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {}
             }
@@ -229,8 +218,8 @@ where
                 .reset(tokio::time::Instant::now() + downlink_only_timeout);
         }
 
-        let a_progress = a_to_b.bytes_transferred() > a_bytes_before && a_to_b.has_flushed();
-        let b_progress = b_to_a.bytes_transferred() > b_bytes_before && b_to_a.has_flushed();
+        let a_progress = a_to_b.bytes_transferred() > a_bytes_before;
+        let b_progress = b_to_a.bytes_transferred() > b_bytes_before;
         if a_progress || b_progress {
             idle_sleep
                 .as_mut()
@@ -409,5 +398,111 @@ mod tests {
             result.b_to_a,
             "recorded download must match relay count"
         );
+    }
+
+    // ── RED: flush_ok false-negative on idle timer ────────────────────────────
+    //
+    // A writer whose poll_flush always returns Pending keeps flush_ok = false
+    // even when bytes ARE transferred.  With the current progress check:
+    //
+    //   a_progress = bytes_transferred > before && has_flushed()
+    //
+    // the idle timer is NEVER reset despite active data flow, causing a
+    // premature IdleTimeout.
+    //
+    // Setup:
+    //   t = 0.0  relay starts, idle_sleep fires at t = 1.0
+    //   t = 0.5  we inject 64 bytes → relay transfers them → flush_ok = false
+    //            → timer NOT reset (bug) or reset to t = 1.5 (fix)
+    //   t = 1.2  advance past original deadline but before reset deadline
+    //            bug:  relay finished (IdleTimeout at t = 1.0)
+    //            fix:  relay alive   (timer at t = 1.5, not yet fired)
+
+    /// Accepts all bytes, but poll_flush always returns Pending.
+    /// Used to keep flush_ok = false while bytes flow freely.
+    struct PendingFlushWriter;
+
+    impl AsyncRead for PendingFlushWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingFlushWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending // keeps flush_ok = false
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn red_idle_timer_not_reset_when_flush_always_pending() {
+        use tokio::time::Duration;
+
+        let (client_tx, client_rx) = tokio::io::duplex(8192);
+
+        let relay = tokio::spawn(async move {
+            let mut a = client_rx;
+            let mut b = PendingFlushWriter;
+            copy_bidirectional_with_stats(
+                &mut a, &mut b, 1, // idle_timeout = 1 s
+                10, 10, 1024, None,
+            )
+            .await
+        });
+
+        // ── CRITICAL: let the relay task run at t = 0 so idle_sleep is armed
+        // at t = 0 + 1 = 1.0 s, not at the time of the first advance.
+        // Without this yield the relay first runs during advance(500ms) and the
+        // sleep starts at t = 0.5 → fires at t = 1.5 regardless of the bug.
+        tokio::task::yield_now().await; // relay first poll: idle_sleep armed at t = 1.0
+
+        // t = 0.0 → 0.5: relay waits (no data yet), idle_sleep deadline = t = 1.0
+        tokio::time::advance(Duration::from_millis(500)).await;
+
+        // inject bytes at t = 0.5 (WITHOUT closing the pipe)
+        // FIX: a_progress = bytes(64) > before(0) → idle_sleep reset to t = 1.5
+        // BUG: flush_ok = false → a_progress = false → idle_sleep stays at t = 1.0
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut tx = client_tx;
+            tx.write_all(&[0u8; 64]).await.unwrap();
+            tokio::task::yield_now().await; // relay processes the 64 bytes
+            std::mem::forget(tx); // prevent EOF: keep write side alive (leaked)
+        }
+
+        // t = 0.5 → 1.2: advance past the original deadline (1.0) but not yet
+        // past the reset deadline (1.5).
+        tokio::time::advance(Duration::from_millis(700)).await;
+        tokio::task::yield_now().await; // allow relay to process any fired timers
+
+        let timed_out = relay.is_finished();
+
+        // BUG:  idle_sleep fired at t = 1.0 (timer never reset because flush_ok = false
+        //       blocked the progress check) → relay terminated → is_finished() = true
+        //       → !true = false → assertion FAILS  ← RED
+        // FIX:  timer was reset to t = 1.5 > t = 1.2 → relay still alive
+        //       → is_finished() = false → !false = true → assertion PASSES  ← GREEN
+        assert!(
+            !timed_out,
+            "relay timed out at t=1.2s: bytes were transferred at t=0.5s so the \
+             idle timer should have been reset to t=1.5s, but flush_ok=false \
+             prevented the progress check from registering the transfer"
+        );
+
+        relay.abort();
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -61,6 +61,10 @@ panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v
 
 [[bench]]
 name = "padding_phase1"
+harness = false
+
+[[bench]]
+name = "uot_alloc"
 harness = false
 
 [profile.release]
