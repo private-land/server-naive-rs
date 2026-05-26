@@ -238,7 +238,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for NaivePaddedTransport<T> {
         let this = &mut *self;
 
         // Flush any in-progress padded frame before accepting new data.
-        if this.write_pending.is_some() {
+        // Use a while-loop (mirrors poll_flush) so a partial Ready(Ok(n)) keeps
+        // trying instead of returning Pending without a registered waker.
+        while this.write_pending.is_some() {
             let pending = this.write_pending.as_ref().unwrap().clone();
             let remaining = &pending[this.write_pending_off..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
@@ -255,9 +257,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for NaivePaddedTransport<T> {
                     if this.write_pending_off >= pending.len() {
                         this.write_pending = None;
                         this.write_pending_off = 0;
-                    } else {
-                        return Poll::Pending;
                     }
+                    // partial write: loop continues until cleared or Pending
                 }
             }
         }
@@ -337,6 +338,98 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for NaivePaddedTransport<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CapWriter {
+        cap: usize,
+    }
+
+    impl tokio::io::AsyncRead for CapWriter {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for CapWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len().min(self.cap)))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// RED → GREEN regression for the partial-write stall.
+    ///
+    /// payload = 100 bytes → frame = 3 + 100 + pad ≥ 103 bytes > cap = 50,
+    /// so the immediate-flush attempt always leaves write_pending non-empty.
+    /// The second write_all enters Phase 1 and must drain those bytes.
+    ///
+    /// BUG (before fix): Phase 1 did `Ready(Ok(50))` with bytes remaining →
+    ///   returned `Poll::Pending` without registering a waker → task parked
+    ///   forever → timeout fires.
+    /// FIX (after fix): Phase 1 uses a while-loop → keeps writing until
+    ///   write_pending is cleared → no stall.
+    #[tokio::test(start_paused = true)]
+    async fn test_poll_write_partial_write_no_stall() {
+        use tokio::io::AsyncWriteExt;
+
+        let mut transport = NaivePaddedTransport::new(CapWriter { cap: 50 });
+        let payload = vec![0xABu8; 100];
+
+        // Frame 1: accepted by poll_write (returns Ready(Ok(100))).
+        // Leaves write_pending with ≥53 unflushed bytes.
+        transport.write_all(&payload).await.unwrap();
+
+        // Frame 2: Phase 1 must drain the leftover bytes from frame 1.
+        // Without fix: returns Pending with no waker → timeout fires.
+        // With fix: while-loop drains → proceeds normally.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            transport.write_all(&payload),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "poll_write stalled: Phase 1 returned Pending without waker on partial write"
+        );
+    }
+
+    /// Boundary: cap=1 forces the while-loop to iterate byte-by-byte through the
+    /// entire frame, exercising the "exactly 1 byte remaining" path on every frame.
+    #[tokio::test(start_paused = true)]
+    async fn test_poll_write_partial_write_byte_by_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let mut transport = NaivePaddedTransport::new(CapWriter { cap: 1 });
+        let payload = vec![0xCDu8; 5];
+
+        for _ in 0..8 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                transport.write_all(&payload),
+            )
+            .await;
+            assert!(result.is_ok(), "stalled on byte-by-byte drain");
+        }
+    }
 
     #[test]
     fn padding_header_length() {
