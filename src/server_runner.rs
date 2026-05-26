@@ -516,19 +516,12 @@ mod tests {
     #[test]
     fn test_make_transport_config_initial_rtt_is_lower_than_spec_default() {
         // The spec-mandated default is 333 ms; our tuned default must be lower.
-        assert!(
-            super::QUIC_INITIAL_RTT_MS < 333,
-            "QUIC_INITIAL_RTT_MS ({}) must be less than the 333 ms spec default",
-            super::QUIC_INITIAL_RTT_MS
-        );
+        const { assert!(super::QUIC_INITIAL_RTT_MS < 333) };
     }
 
     #[test]
     fn test_make_transport_config_keepalive_less_than_idle_timeout() {
-        assert!(
-            super::QUIC_KEEPALIVE_INTERVAL_SECS < super::QUIC_MAX_IDLE_TIMEOUT_SECS,
-            "keep-alive interval must be less than idle timeout"
-        );
+        const { assert!(super::QUIC_KEEPALIVE_INTERVAL_SECS < super::QUIC_MAX_IDLE_TIMEOUT_SECS) };
     }
 
     /// Verify that a silent client (no H2 preface) is rejected within the request_timeout.
