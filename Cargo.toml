@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 
 [dependencies]
@@ -42,8 +42,8 @@ acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0" }
 
 # Panel Integration (Connect-RPC via QUIC/H3)
-panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.15" }
-panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.15" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.17" }
+panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.17" }
 
 [[bin]]
 name = "server-naive-agent"
@@ -56,7 +56,7 @@ rcgen = "0.14"
 # expose ConnectionState trait so tests can read remote SETTINGS without a full h3 client loop
 h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
-panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.15" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.17" }
 
 [profile.release]
 opt-level = 3

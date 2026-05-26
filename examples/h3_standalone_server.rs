@@ -102,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         acl_conf_file: None,
         data_dir: std::path::PathBuf::from("/tmp/naive-standalone"),
         block_private_ip: args.block_private_ip,
+        congestion_control: server_naive_rs::config::CongestionControl::Bbr,
     };
 
     let dns_cache = dns_cache_rs::DnsCache::new();
