@@ -91,6 +91,47 @@ const QUIC_KEEPALIVE_INTERVAL_SECS: u64 = 20;
 /// Capped conservatively at 2 minutes to match typical NAT/middlebox limits.
 const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 120;
 
+/// Initial RTT estimate for QUIC connections.
+///
+/// Quinn's spec-mandated default is 333 ms, which is intentionally conservative.
+/// For proxy use-cases (international links, 50-200 ms actual RTT) a lower value
+/// gives faster initial pacing without sacrificing correctness — the real RTT is
+/// measured after the first round-trip and used from then on.
+const QUIC_INITIAL_RTT_MS: u64 = 100;
+
+/// Build a QUIC `TransportConfig` with the requested congestion controller and
+/// sensible defaults for a NaiveProxy server.
+///
+/// Extracted as a free function so that unit tests can exercise every CC variant
+/// without spinning up a full QUIC endpoint.
+pub(crate) fn make_transport_config(cc: &config::CongestionControl) -> quinn::TransportConfig {
+    use quinn::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
+
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(std::time::Duration::from_secs(
+        QUIC_KEEPALIVE_INTERVAL_SECS,
+    )));
+    tc.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(QUIC_MAX_IDLE_TIMEOUT_SECS))
+            .expect("QUIC idle timeout value is valid"),
+    ));
+    tc.initial_rtt(std::time::Duration::from_millis(QUIC_INITIAL_RTT_MS));
+
+    match cc {
+        config::CongestionControl::Bbr => {
+            tc.congestion_controller_factory(Arc::new(BbrConfig::default()));
+        }
+        config::CongestionControl::Cubic => {
+            tc.congestion_controller_factory(Arc::new(CubicConfig::default()));
+        }
+        config::CongestionControl::NewReno => {
+            tc.congestion_controller_factory(Arc::new(NewRenoConfig::default()));
+        }
+    }
+
+    tc
+}
+
 /// Run the Naive server accept loop.
 pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Result<()> {
     use tokio::sync::Semaphore;
@@ -277,14 +318,7 @@ pub async fn run_h3_server(server: Arc<Server>, config: &config::ServerConfig) -
     let quinn_crypto = QuicServerConfig::try_from(tls_config)
         .map_err(|e| anyhow!("Failed to build Quinn TLS config: {}", e))?;
 
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-        QUIC_KEEPALIVE_INTERVAL_SECS,
-    )));
-    transport_config.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(QUIC_MAX_IDLE_TIMEOUT_SECS))
-            .expect("QUIC idle timeout value is valid"),
-    ));
+    let transport_config = make_transport_config(&config.congestion_control);
 
     let mut quinn_server = quinn::ServerConfig::with_crypto(Arc::new(quinn_crypto));
     quinn_server.transport_config(Arc::new(transport_config));
@@ -456,6 +490,38 @@ mod tests {
     fn test_h2_window_sizes_are_reasonable() {
         const { assert!(super::H2_INITIAL_WINDOW_SIZE >= 64 * 1024) };
         const { assert!(super::H2_INITIAL_CONN_WINDOW_SIZE >= super::H2_INITIAL_WINDOW_SIZE) };
+    }
+
+    // ── make_transport_config ────────────────────────────────────────────────
+
+    #[test]
+    fn test_make_transport_config_bbr_does_not_panic() {
+        let tc = super::make_transport_config(&crate::config::CongestionControl::Bbr);
+        // Verify it can be wrapped in Arc (i.e. it's a complete, valid config).
+        let _ = Arc::new(tc);
+    }
+
+    #[test]
+    fn test_make_transport_config_cubic_does_not_panic() {
+        let tc = super::make_transport_config(&crate::config::CongestionControl::Cubic);
+        let _ = Arc::new(tc);
+    }
+
+    #[test]
+    fn test_make_transport_config_new_reno_does_not_panic() {
+        let tc = super::make_transport_config(&crate::config::CongestionControl::NewReno);
+        let _ = Arc::new(tc);
+    }
+
+    #[test]
+    fn test_make_transport_config_initial_rtt_is_lower_than_spec_default() {
+        // The spec-mandated default is 333 ms; our tuned default must be lower.
+        const { assert!(super::QUIC_INITIAL_RTT_MS < 333) };
+    }
+
+    #[test]
+    fn test_make_transport_config_keepalive_less_than_idle_timeout() {
+        const { assert!(super::QUIC_KEEPALIVE_INTERVAL_SECS < super::QUIC_MAX_IDLE_TIMEOUT_SECS) };
     }
 
     /// Verify that a silent client (no H2 preface) is rejected within the request_timeout.

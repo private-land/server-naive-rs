@@ -267,6 +267,19 @@ impl CliArgs {
     }
 }
 
+/// QUIC congestion control algorithm for a naive H3 node.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CongestionControl {
+    /// BBR — bandwidth-delay product based; best for high-latency proxy links (default).
+    #[default]
+    Bbr,
+    /// CUBIC — loss-based; Quinn's original default.
+    Cubic,
+    /// NewReno — classic loss-based algorithm.
+    NewReno,
+}
+
 /// Transport network mode for a naive node.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -296,6 +309,9 @@ pub struct NaiveConfig {
     /// Transport mode: "tcp" (H2+TLS, default) or "udp" (H3+QUIC).
     #[serde(default)]
     pub network: NaiveNetwork,
+    /// QUIC congestion control algorithm (H3 only). Defaults to BBR.
+    #[serde(default)]
+    pub congestion_control: CongestionControl,
 }
 
 /// Parse a `NodeConfigEnum` into a `NaiveConfig`.
@@ -364,6 +380,8 @@ pub struct ServerConfig {
     pub acl_conf_file: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub block_private_ip: bool,
+    /// QUIC congestion control algorithm (H3 only).
+    pub congestion_control: CongestionControl,
 }
 
 impl ServerConfig {
@@ -375,6 +393,7 @@ impl ServerConfig {
             acl_conf_file: cli.acl_conf_file.clone(),
             data_dir: cli.data_dir.clone(),
             block_private_ip: cli.block_private_ip,
+            congestion_control: remote.congestion_control.clone(),
         })
     }
 }
@@ -488,13 +507,51 @@ mod tests {
         assert!(cli.validate().is_err());
     }
 
+    // ── CongestionControl ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_congestion_control_default_is_bbr() {
+        let cc = CongestionControl::default();
+        assert_eq!(cc, CongestionControl::Bbr);
+    }
+
+    #[test]
+    fn test_congestion_control_deserialize_bbr() {
+        let cc: CongestionControl = serde_json::from_str(r#""bbr""#).unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
+    }
+
+    #[test]
+    fn test_congestion_control_deserialize_cubic() {
+        let cc: CongestionControl = serde_json::from_str(r#""cubic""#).unwrap();
+        assert_eq!(cc, CongestionControl::Cubic);
+    }
+
+    #[test]
+    fn test_congestion_control_deserialize_new_reno() {
+        let cc: CongestionControl = serde_json::from_str(r#""new_reno""#).unwrap();
+        assert_eq!(cc, CongestionControl::NewReno);
+    }
+
+    #[test]
+    fn test_congestion_control_unknown_value_fails() {
+        let result: Result<CongestionControl, _> = serde_json::from_str(r#""invalid""#);
+        assert!(
+            result.is_err(),
+            "unknown congestion control value must fail"
+        );
+    }
+
+    // ── NaiveConfig congestion_control ───────────────────────────────────────
+
     #[test]
     fn test_parse_naive_config_success() {
         let json = r#"{"server_port":443}"#;
         let config_enum = NodeConfigEnum::Naive(json.to_string());
         let config = parse_naive_config(config_enum).unwrap();
         assert_eq!(config.server_port, 443);
-        assert_eq!(config.network, NaiveNetwork::Tcp); // defaults to tcp
+        assert_eq!(config.network, NaiveNetwork::Tcp);
+        assert_eq!(config.congestion_control, CongestionControl::Bbr); // defaults to bbr
     }
 
     #[test]
@@ -504,7 +561,31 @@ mod tests {
         let config = parse_naive_config(config_enum).unwrap();
         assert_eq!(config.server_port, 443);
         assert_eq!(config.network, NaiveNetwork::Udp);
+        assert_eq!(config.congestion_control, CongestionControl::Bbr); // still defaults
     }
+
+    #[test]
+    fn test_parse_naive_config_with_congestion_control_bbr() {
+        let json = r#"{"server_port":443,"network":"udp","congestion_control":"bbr"}"#;
+        let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
+        assert_eq!(config.congestion_control, CongestionControl::Bbr);
+    }
+
+    #[test]
+    fn test_parse_naive_config_with_congestion_control_cubic() {
+        let json = r#"{"server_port":443,"network":"udp","congestion_control":"cubic"}"#;
+        let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
+        assert_eq!(config.congestion_control, CongestionControl::Cubic);
+    }
+
+    #[test]
+    fn test_parse_naive_config_with_congestion_control_new_reno() {
+        let json = r#"{"server_port":443,"network":"udp","congestion_control":"new_reno"}"#;
+        let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
+        assert_eq!(config.congestion_control, CongestionControl::NewReno);
+    }
+
+    // ── ServerConfig propagation ─────────────────────────────────────────────
 
     #[test]
     fn test_parse_naive_config_wrong_variant() {
@@ -517,12 +598,25 @@ mod tests {
         let remote = NaiveConfig {
             server_port: 443,
             network: NaiveNetwork::Tcp,
+            congestion_control: CongestionControl::Bbr,
         };
         let cli = create_test_cli_args();
         let config = ServerConfig::from_remote(&remote, &cli).unwrap();
         assert_eq!(config.port, 443);
         assert!(config.cert.is_some());
         assert!(config.key.is_some());
+        assert_eq!(config.congestion_control, CongestionControl::Bbr);
+    }
+
+    #[test]
+    fn test_server_config_propagates_cubic() {
+        let remote = NaiveConfig {
+            server_port: 443,
+            network: NaiveNetwork::Udp,
+            congestion_control: CongestionControl::Cubic,
+        };
+        let config = ServerConfig::from_remote(&remote, &create_test_cli_args()).unwrap();
+        assert_eq!(config.congestion_control, CongestionControl::Cubic);
     }
 
     #[test]
