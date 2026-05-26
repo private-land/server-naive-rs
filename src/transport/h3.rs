@@ -514,6 +514,15 @@ mod tests {
                     .unwrap();
 
                 let resolver = h3conn.accept().await.unwrap().unwrap();
+                // Spawn a detached driver that keeps h3conn polled so the QUIC
+                // layer can flush outgoing send_data frames.  h3conn is moved here;
+                // the task stays alive until the connection closes naturally, giving
+                // the bridge's download task time to deliver all data before
+                // CONNECTION_CLOSE is sent.
+                tokio::spawn(async move {
+                    while let Ok(Some(_)) = h3conn.accept().await {}
+                });
+
                 let (_req, mut stream) = resolver.resolve_request().await.unwrap();
                 stream
                     .send_response(http::Response::builder().status(200).body(()).unwrap())
@@ -530,9 +539,7 @@ mod tests {
                 let down_payload = vec![0xCDu8; DOWN_SIZE];
                 transport.write_all(&down_payload).await.unwrap();
                 transport.shutdown().await.unwrap();
-                // Wait for the bridge tasks to flush send_data + finish() before
-                // h3conn is dropped (dropping sends CONNECTION_CLOSE which would
-                // race with in-flight DATA frames on the client side).
+                // Wait for bridge tasks to flush send_data + finish().
                 transport.wait_closed().await;
 
                 // Return the first and last upload bytes for verification.
