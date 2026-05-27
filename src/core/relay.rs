@@ -245,6 +245,16 @@ where
                 .reset(tokio::time::Instant::now() + idle_timeout);
         }
 
+        // When in uplink-only half-close (client closed, server still sending),
+        // reset the half-close timer on each burst of downlink data so that a
+        // slow-but-active download is not cut off by uplink_only_timeout.
+        // The idle_timeout still fires if the server goes completely silent.
+        if half_close_active && b_progress {
+            half_close_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + uplink_only_timeout);
+        }
+
         if a_to_b.is_done() && b_to_a.is_done() {
             termination = RelayTermination::Completed;
             return Poll::Ready(Ok(true));
@@ -754,6 +764,119 @@ mod tests {
              relay stats: a_to_b={}, b_to_a={}",
             r.a_to_b,
             r.b_to_a,
+        );
+    }
+
+    /// Verifies that `uplink_only_timeout` does not prematurely cut off a slow
+    /// but active download when `suppress_a_to_b_shutdown = true`.
+    ///
+    /// Setup (paused time):
+    ///   uplink_only_timeout = 1 s  (intentionally short)
+    ///   idle_timeout        = 300 s
+    ///
+    ///   t = 0.0  relay starts; client sends GET + closes upload.
+    ///            half_close_sleep armed at t = 1.0 s.
+    ///   t = 0.5  server sends first chunk → b_progress = true
+    ///            → half_close_sleep reset to t = 1.5 s  (WITH the fix)
+    ///   t = 1.2  advance past original deadline (1.0) but below reset (1.5).
+    ///            BUG:  half_close_sleep fires at 1.0 → HalfCloseTimeout
+    ///            FIX:  deadline = 1.5, relay still alive → server keeps sending
+    ///   t = 1.5+  server finishes and closes → relay completes (Completed)
+    #[tokio::test(start_paused = true)]
+    async fn test_uplink_only_timer_resets_on_download_progress() {
+        use tokio::time::Duration;
+
+        let (a_relay, a_client) = tokio::io::duplex(8192);
+        let (b_relay, b_server) = tokio::io::duplex(64 * 1024);
+
+        // Server: waits 500 ms then sends data, simulating a slow-start download.
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut b = b_server;
+            let mut req = vec![0u8; 256];
+            let _ = b.read(&mut req).await; // consume GET
+
+            // Pause 500 ms (less than uplink_only_timeout=1 s but enough to
+            // let the timer arm before the first data arrives).
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Send first chunk → resets half_close_sleep to now+1s = t=1.5s.
+            b.write_all(&[b'D'; 4096]).await.unwrap();
+
+            // Pause another 800 ms and send final chunk at t≈1.3s.
+            // Without the fix the relay would have died at t=1.0s.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            b.write_all(&[b'D'; 4096]).await.unwrap();
+
+            b.shutdown().await.unwrap();
+        });
+
+        // Client: writes GET then closes upload; reads the download body.
+        let client_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut cr, mut cw) = tokio::io::split(a_client);
+            cw.write_all(b"GET /download HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
+            cw.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            cr.read_to_end(&mut buf).await.ok();
+            buf.len()
+        });
+
+        // Relay: must be spawned so we can advance time from this task.
+        let relay_task = tokio::spawn(async move {
+            let mut a = a_relay;
+            let mut b = b_relay;
+            copy_bidirectional_with_stats(
+                &mut a, &mut b, 300, // idle_timeout: generous
+                1,   // uplink_only_timeout = 1 s (shorter than total transfer time)
+                30,  // downlink_only_timeout
+                4096, None, true, // suppress FIN
+            )
+            .await
+        });
+
+        // Let all three tasks get to their first await point.
+        tokio::task::yield_now().await;
+
+        // t = 0 → 0.5: relay waits; server sleeping; half_close_sleep @ 1.0 s.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await; // server wakes, sends first chunk; relay polls
+
+        // t = 0.5 → 1.2: advance past original 1.0 s deadline.
+        // BUG  (no fix): relay dead (HalfCloseTimeout fired at t=1.0)
+        // FIX          : half_close_sleep was reset to 1.5 s; relay still alive.
+        tokio::time::advance(Duration::from_millis(700)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !relay_task.is_finished(),
+            "relay must still be alive at t=1.2s: the half-close timer should \
+             have been reset to t=1.5s when the server sent its first chunk at t=0.5s"
+        );
+
+        // Let the rest of the transfer finish (server sends second chunk at t≈1.3s,
+        // then closes; relay completes).
+        tokio::time::advance(Duration::from_millis(600)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+
+        let r = relay_task.await.unwrap().unwrap();
+        let bytes_received = client_task.await.unwrap();
+        server_task.await.unwrap();
+
+        assert_eq!(
+            r.termination,
+            RelayTermination::Completed,
+            "relay must finish with Completed, not HalfCloseTimeout; \
+             received {} bytes",
+            bytes_received
+        );
+        assert_eq!(
+            bytes_received, 8192,
+            "client must receive both 4 KiB chunks"
         );
     }
 }
