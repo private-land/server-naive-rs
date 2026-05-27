@@ -357,6 +357,13 @@ where
 {
     let relay_start = std::time::Instant::now();
     let stats = Arc::clone(&server.stats);
+    // suppress_a_to_b_shutdown = true: do not forward a client half-close as a
+    // TCP FIN to the origin server.  Naive/sing-box clients close their QUIC
+    // upload stream (END_STREAM) after sending a proxied GET request; without
+    // this flag the relay would send a TCP FIN to the origin, causing servers
+    // such as ooklaserver (speedtest.net) to return only HTTP headers and skip
+    // the response body, breaking download tests.  The uplink-only timeout
+    // still applies as a safety bound after the client upload closes.
     let relay_fut = copy_bidirectional_with_stats(
         padded,
         remote_stream,
@@ -365,6 +372,7 @@ where
         server.conn_config.downlink_only_timeout_secs(),
         server.conn_config.buffer_size,
         Some((user_id, stats)),
+        true,
     );
 
     let cancelled = tokio::select! {
