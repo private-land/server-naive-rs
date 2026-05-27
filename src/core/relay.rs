@@ -1,4 +1,22 @@
-//! Bidirectional relay with idle timeout, half-close timeout, and traffic statistics
+//! Bidirectional relay with idle timeout and traffic statistics.
+//!
+//! Design notes (sing-box parity)
+//! ──────────────────────────────
+//! After a directional buffer reaches EOF on its reader, we either:
+//!
+//!   • call `poll_shutdown` on the peer writer (TCP FIN, default), or
+//!   • mark the side as done without shutting down (`suppress_shutdown=true`,
+//!     reserved for protocols where forwarding FIN is wrong).
+//!
+//! Then we *wait indefinitely* for the other direction to finish — there is
+//! no application-level half-close timer.  This mirrors sing-box's
+//! `bufio.CopyConn`, whose `task.Group` simply waits for both upload and
+//! download goroutines to complete.  Earlier revisions had an
+//! `uplink_only_timeout` that fired N seconds after client EOF; it
+//! prematurely cut HTTP/1.1 keep-alive responses (ooklaserver speedtest
+//! upload ACKs, in particular) and is now gone.  The coarse
+//! `idle_timeout` — which only fires when *both* directions are silent —
+//! plus the QUIC/TCP transport idle timeouts are the sole safety nets.
 
 use std::future::Future;
 use std::io;
@@ -9,25 +27,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
-/// Half-close idle window: how long to wait after the *last* byte from the
-/// origin server, once the client has half-closed its upload direction (relay
-/// is in uplink-only half-close state).
-///
-/// Normal path (Connection: close): the origin sends its response body + FIN.
-/// The relay's b_to_a direction reaches EOF and both sides complete with
-/// `Completed` — this timer never fires for well-behaved origins.
-///
-/// Safety net path (Connection: keep-alive): the origin sends its response
-/// but holds the TCP connection open.  In that case half_close remains active
-/// and this short idle window fires after UPLINK_HALF_CLOSE_IDLE seconds of
-/// silence, closing the relay promptly instead of stalling for the full
-/// `uplink_only_timeout` (default 30 s).
-const UPLINK_HALF_CLOSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(30);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayTermination {
     Completed,
-    HalfCloseTimeout,
     IdleTimeout,
     Error,
 }
@@ -36,7 +38,6 @@ impl std::fmt::Display for RelayTermination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Completed => f.write_str("completed"),
-            Self::HalfCloseTimeout => f.write_str("half_close_timeout"),
             Self::IdleTimeout => f.write_str("idle_timeout"),
             Self::Error => f.write_str("error"),
         }
@@ -64,15 +65,12 @@ struct DirectionalBuffer {
     read_done: bool,
     shutdown_done: bool,
     /// When true, skip calling `poll_shutdown` on the writer when the reader
-    /// reaches EOF.  Use this for the A→B direction in CONNECT tunnelling so
-    /// that a client half-close (e.g. QUIC upload END_STREAM after a GET
-    /// request) is *not* forwarded as a TCP FIN to the origin server.
+    /// reaches EOF — i.e. do NOT forward the half-close to the peer.
     ///
-    /// Background: some servers (e.g. ooklaserver used by speedtest.net) return
-    /// only HTTP headers when they receive a request + immediate FIN, because
-    /// they interpret the FIN as "client is done and will not read more".
-    /// Suppressing the FIN lets the server send the full response body while
-    /// the relay still enforces the uplink-only half-close timeout.
+    /// In production this is `false` for the A→B direction so that client
+    /// END_STREAM is propagated as a TCP FIN, matching sing-box's CopyConn +
+    /// N.CloseWrite design.  The flag is retained for protocols where FIN
+    /// forwarding would be wrong (none currently in use).
     suppress_shutdown: bool,
 }
 
@@ -200,17 +198,18 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    // The `uplink_only_secs` / `downlink_only_secs` parameters are retained for
+    // API compatibility but intentionally ignored: sing-box's reference NaiveProxy
+    // server has no application-level half-close timer, and adding one cuts
+    // ooklaserver speedtest uploads/downloads mid-transfer when the origin uses
+    // HTTP/1.1 keep-alive.  We rely on the coarse `idle_timeout` (and, in
+    // production, on QUIC's own idle timeout) as the sole safety net.
+    let _ = (uplink_only_secs, downlink_only_secs);
+
     let mut a_to_b = DirectionalBuffer::new(buffer_size, suppress_a_to_b_shutdown);
     let mut b_to_a = DirectionalBuffer::new(buffer_size, false);
 
     let idle_timeout = tokio::time::Duration::from_secs(idle_timeout_secs);
-    let uplink_only_timeout = tokio::time::Duration::from_secs(uplink_only_secs);
-    let downlink_only_timeout = tokio::time::Duration::from_secs(downlink_only_secs);
-
-    let half_close_sleep = tokio::time::sleep(tokio::time::Duration::ZERO);
-    tokio::pin!(half_close_sleep);
-    let mut half_close_active = false;
-
     let idle_sleep = tokio::time::sleep(idle_timeout);
     tokio::pin!(idle_sleep);
 
@@ -240,32 +239,6 @@ where
             }
         }
 
-        if a_to_b.has_read_eof() && !b_to_a.is_done() && !half_close_active {
-            half_close_active = true;
-            // If the origin has already started responding before the client
-            // half-closed (e.g. latency ping: server sends 302, then client
-            // sends END_STREAM), arm the short idle window — the response is
-            // already on the wire, so we only need to detect the keep-alive
-            // silence.  Otherwise (download case: client closes upload before
-            // server begins streaming the body), arm uplink_only_timeout to
-            // give the origin time to start; subsequent b_progress events will
-            // reset the timer to the short window on each chunk.
-            let initial = if b_to_a.bytes_transferred() > 0 {
-                uplink_only_timeout.min(UPLINK_HALF_CLOSE_IDLE)
-            } else {
-                uplink_only_timeout
-            };
-            half_close_sleep
-                .as_mut()
-                .reset(tokio::time::Instant::now() + initial);
-        }
-        if b_to_a.has_read_eof() && !a_to_b.is_done() && !half_close_active {
-            half_close_active = true;
-            half_close_sleep
-                .as_mut()
-                .reset(tokio::time::Instant::now() + downlink_only_timeout);
-        }
-
         let a_progress = a_to_b.bytes_transferred() > a_bytes_before;
         let b_progress = b_to_a.bytes_transferred() > b_bytes_before;
         if a_progress || b_progress {
@@ -274,35 +247,9 @@ where
                 .reset(tokio::time::Instant::now() + idle_timeout);
         }
 
-        // Safety net for keep-alive origins: when in uplink-only half-close and
-        // the origin is sending data (Connection: keep-alive, no FIN), refresh
-        // the timer to a short idle window on every burst of downlink data.
-        //
-        // Well-behaved origins (Connection: close) send FIN after the response;
-        // b_to_a reaches EOF and the relay completes normally — this branch is
-        // not reached for them.
-        //
-        // For keep-alive origins: each arriving chunk resets the timer so active
-        // transfers are never cut short; once the origin goes silent the relay
-        // closes after UPLINK_HALF_CLOSE_IDLE instead of the full
-        // uplink_only_timeout (default 30 s).
-        if half_close_active && b_progress {
-            // Use the shorter of uplink_only_timeout and the idle window, so that
-            // a custom very-short uplink_only_timeout is still respected.
-            let idle = uplink_only_timeout.min(UPLINK_HALF_CLOSE_IDLE);
-            half_close_sleep
-                .as_mut()
-                .reset(tokio::time::Instant::now() + idle);
-        }
-
         if a_to_b.is_done() && b_to_a.is_done() {
             termination = RelayTermination::Completed;
             return Poll::Ready(Ok(true));
-        }
-
-        if half_close_active && half_close_sleep.as_mut().poll(cx).is_ready() {
-            termination = RelayTermination::HalfCloseTimeout;
-            return Poll::Ready(Ok(false));
         }
 
         if idle_sleep.as_mut().poll(cx).is_ready() {
@@ -391,18 +338,47 @@ mod tests {
         }
     }
 
+    /// Sing-box parity: after the client closes its upload (a_to_b reaches EOF),
+    /// the relay forwards FIN to the peer and then waits for the peer to finish
+    /// — there is no half-close timer.  Earlier revisions fired
+    /// `uplink_only_timeout` 30 s after client EOF, which severed slow
+    /// HTTP/1.1 keep-alive responses such as ooklaserver speedtest upload ACKs.
+    ///
+    /// The regression test below verifies the timer is gone: the relay must
+    /// still be alive 60 s after client EOF (well past the historical 30 s
+    /// window), assuming the peer is still open.
     #[tokio::test(start_paused = true)]
-    async fn test_uplink_only_timeout_on_client_eof() {
-        let mut client = Cursor::new(b"hello".to_vec());
-        let mut remote = NeverEofSink;
+    async fn test_no_half_close_timer_after_client_eof() {
+        use tokio::time::Duration;
 
-        let result =
-            copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1, 100, 1024, None, false)
-                .await
-                .unwrap();
+        let relay_task = tokio::spawn(async move {
+            let mut client = Cursor::new(b"hello".to_vec());
+            let mut remote = NeverEofSink;
+            copy_bidirectional_with_stats(
+                &mut client,
+                &mut remote,
+                300, // idle_timeout = 5 min — must NOT fire in this test
+                1,   // (ignored) historical uplink_only_timeout
+                1,   // (ignored) historical downlink_only_timeout
+                1024,
+                None,
+                false,
+            )
+            .await
+        });
 
-        assert!(!result.completed);
-        assert_eq!(result.termination, RelayTermination::HalfCloseTimeout);
+        // Drive the relay to its first poll so the idle timer is armed.
+        tokio::task::yield_now().await;
+        // Advance 60 s — twice the historical half-close window.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !relay_task.is_finished(),
+            "relay must still be running 60 s after client EOF — the half-close \
+             timer was removed in v0.2.9 to match sing-box behaviour"
+        );
+        relay_task.abort();
     }
 
     #[tokio::test(start_paused = true)]
@@ -579,26 +555,17 @@ mod tests {
 
     // ── TCP half-close / FIN propagation tests ───────────────────────────────
     //
-    // Background (HTTP CONNECT tunnelling half-close semantics)
-    // ─────────────────────────────────────────────────────────
-    // When a NaiveProxy/sing-box client closes its QUIC upload stream
-    // (END_STREAM) after forwarding a proxied HTTP GET request, the H3Transport
-    // bridge propagates that as an EOF through the relay's A→B DirectionalBuffer.
-    // The relay then calls `poll_shutdown` on the TCP socket (B writer), sending
-    // a TCP FIN to the origin server.
+    // When a NaiveProxy / sing-box client closes its QUIC upload stream
+    // (END_STREAM) after forwarding a proxied HTTP request, the H3 bridge
+    // propagates that as an EOF through the relay's A→B DirectionalBuffer.
+    // With `suppress_a_to_b_shutdown = false` (production setting, matching
+    // sing-box's `CopyConn` + `N.CloseWrite`), the relay calls `poll_shutdown`
+    // on the B writer, sending a TCP FIN to the origin server.  HTTP/1.1
+    // servers (including ooklaserver) reply with the full response body once
+    // they see FIN — it just signals "client is done writing".
     //
-    // This is correct behaviour: HTTP/1.1 servers (including ooklaserver used by
-    // speedtest.net) send the full response body when they receive FIN immediately
-    // after the request.  FIN simply signals "client is done writing"; the server
-    // can still send the full response before closing.
-    //
-    // Historical note: an earlier version used `suppress_a_to_b_shutdown = true`
-    // based on a flawed `nc -q1` test.  `nc -q1` exits 1 second after stdin EOF,
-    // BEFORE the full body arrives — so only ~57 bytes (headers) were observed.
-    // Re-testing with curl confirmed ookla sends 100 KB when FIN is used.
-    // sing-box naive H3 propagates FIN identically and works for both latency and
-    // download tests; suppress=true caused a 30-second half-close timeout for
-    // each latency ping, breaking the speedtest latency test.
+    // `suppress_a_to_b_shutdown = true` is retained for protocols where FIN
+    // forwarding is incorrect; the second test below documents its mechanics.
 
     /// `ShutdownRecorder` wraps any `AsyncRead + AsyncWrite` and sets a flag the
     /// moment `poll_shutdown` is called on its write side.  Use it to assert
@@ -706,8 +673,8 @@ mod tests {
     /// Verifies the `suppress_a_to_b_shutdown = true` flag mechanics.
     ///
     /// When suppress=true, a client half-close does NOT send a FIN to the origin.
-    /// The relay marks a_to_b as done immediately and starts the uplink-only
-    /// timeout while the origin server continues sending the response.
+    /// The relay marks a_to_b as done immediately and continues delivering the
+    /// origin's response without forwarding the upload EOF.
     ///
     /// Note: this flag is NOT used in production (suppress=false is correct for
     /// HTTP CONNECT tunnelling).  This test documents the flag's contract in case
@@ -793,116 +760,75 @@ mod tests {
         );
     }
 
-    /// Verifies that `uplink_only_timeout` does not prematurely cut off a slow
-    /// but active download when `suppress_a_to_b_shutdown = true`.
-    ///
-    /// Setup (paused time):
-    ///   uplink_only_timeout = 1 s  (intentionally short)
-    ///   idle_timeout        = 300 s
-    ///
-    ///   t = 0.0  relay starts; client sends GET + closes upload.
-    ///            half_close_sleep armed at t = 1.0 s.
-    ///   t = 0.5  server sends first chunk → b_progress = true
-    ///            → half_close_sleep reset to t = 1.5 s  (WITH the fix)
-    ///   t = 1.2  advance past original deadline (1.0) but below reset (1.5).
-    ///            BUG:  half_close_sleep fires at 1.0 → HalfCloseTimeout
-    ///            FIX:  deadline = 1.5, relay still alive → server keeps sending
-    ///   t = 1.5+  server finishes and closes → relay completes (Completed)
+    /// Sing-box parity regression: a long upload (client streams body + closes
+    /// upload), followed by a long server pause before the small response, must
+    /// NOT be terminated prematurely.  Historical bug: `uplink_only_timeout`
+    /// fired 30 s after client EOF, killing ooklaserver speedtest upload tests.
     #[tokio::test(start_paused = true)]
-    async fn test_uplink_only_timer_resets_on_download_progress() {
+    async fn test_long_post_upload_server_pause_is_not_truncated() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::time::Duration;
 
-        let (a_relay, a_client) = tokio::io::duplex(8192);
+        let (a_relay, a_client) = tokio::io::duplex(64 * 1024);
         let (b_relay, b_server) = tokio::io::duplex(64 * 1024);
 
-        // Server: waits 500 ms then sends data, simulating a slow-start download.
+        // Server: drain the upload, then pause 90 s (3× the old half-close
+        // window) before sending a tiny ACK, then close.
         let server_task = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut b = b_server;
-            let mut req = vec![0u8; 256];
-            let _ = b.read(&mut req).await; // consume GET
-
-            // Pause 500 ms (less than uplink_only_timeout=1 s but enough to
-            // let the timer arm before the first data arrives).
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            // Send first chunk → resets half_close_sleep to now+1s = t=1.5s.
-            b.write_all(&[b'D'; 4096]).await.unwrap();
-
-            // Pause another 800 ms and send final chunk at t≈1.3s.
-            // Without the fix the relay would have died at t=1.0s.
-            tokio::time::sleep(Duration::from_millis(800)).await;
-            b.write_all(&[b'D'; 4096]).await.unwrap();
-
+            let mut sink = [0u8; 4096];
+            loop {
+                match b.read(&mut sink).await {
+                    Ok(0) | Err(_) => break, // client FIN received
+                    Ok(_) => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            b.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
             b.shutdown().await.unwrap();
         });
 
-        // Client: writes GET then closes upload; reads the download body.
         let client_task = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let (mut cr, mut cw) = tokio::io::split(a_client);
-            cw.write_all(b"GET /download HTTP/1.1\r\n\r\n")
+            cw.write_all(b"POST /upload HTTP/1.1\r\nContent-Length: 4096\r\n\r\n")
                 .await
                 .unwrap();
+            cw.write_all(&[0u8; 4096]).await.unwrap();
             cw.shutdown().await.unwrap();
             let mut buf = Vec::new();
             cr.read_to_end(&mut buf).await.ok();
             buf.len()
         });
 
-        // Relay: must be spawned so we can advance time from this task.
         let relay_task = tokio::spawn(async move {
             let mut a = a_relay;
             let mut b = b_relay;
             copy_bidirectional_with_stats(
-                &mut a, &mut b, 300, // idle_timeout: generous
-                1,   // uplink_only_timeout = 1 s (shorter than total transfer time)
-                30,  // downlink_only_timeout
-                4096, None, true, // suppress FIN
+                &mut a, &mut b, 300, // idle_timeout
+                1, 1, // (ignored) historical half-close timeouts
+                4096, None, false, // suppress=false → propagate FIN
             )
             .await
         });
 
-        // Let all three tasks get to their first await point.
-        tokio::task::yield_now().await;
-
-        // t = 0 → 0.5: relay waits; server sleeping; half_close_sleep @ 1.0 s.
-        tokio::time::advance(Duration::from_millis(500)).await;
-        tokio::task::yield_now().await; // server wakes, sends first chunk; relay polls
-
-        // t = 0.5 → 1.2: advance past original 1.0 s deadline.
-        // BUG  (no fix): relay dead (HalfCloseTimeout fired at t=1.0)
-        // FIX          : half_close_sleep was reset to 1.5 s; relay still alive.
-        tokio::time::advance(Duration::from_millis(700)).await;
-        tokio::task::yield_now().await;
-
-        assert!(
-            !relay_task.is_finished(),
-            "relay must still be alive at t=1.2s: the half-close timer should \
-             have been reset to t=1.5s when the server sent its first chunk at t=0.5s"
-        );
-
-        // Let the rest of the transfer finish (server sends second chunk at t≈1.3s,
-        // then closes; relay completes).
-        tokio::time::advance(Duration::from_millis(600)).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(200)).await;
-        tokio::task::yield_now().await;
+        // Pump time forward across the server's 90 s pause + a small margin.
+        for _ in 0..120 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
 
         let r = relay_task.await.unwrap().unwrap();
-        let bytes_received = client_task.await.unwrap();
+        let received = client_task.await.unwrap();
         server_task.await.unwrap();
 
         assert_eq!(
             r.termination,
             RelayTermination::Completed,
-            "relay must finish with Completed, not HalfCloseTimeout; \
-             received {} bytes",
-            bytes_received
+            "relay must finish Completed even after a 90 s post-upload server \
+             pause — no half-close timer should be cutting it off",
         );
-        assert_eq!(
-            bytes_received, 8192,
-            "client must receive both 4 KiB chunks"
-        );
+        assert!(received > 0, "client must receive the server's ACK");
     }
 }

@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "server-naive-rs"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "acl-engine-rs",
  "anyhow",

@@ -357,32 +357,21 @@ where
 {
     let relay_start = std::time::Instant::now();
     let stats = Arc::clone(&server.stats);
-    // suppress_a_to_b_shutdown = true: do NOT forward a client half-close as a
-    // TCP FIN to the origin server.
+    // suppress_a_to_b_shutdown = false: propagate the client's half-close to
+    // the origin via TCP FIN.  This matches sing-box's NaiveProxy server design
+    // (its `CopyConn` calls `N.CloseWrite` on the destination once the source
+    // reaches EOF) and is necessary for HTTP/1.1 + ooklaserver speedtest:
     //
-    // Why we suppress FIN propagation for H3/QUIC → TCP CONNECT tunnelling:
+    //   • Latency / download / upload all use one CONNECT tunnel per logical
+    //     HTTP request.  The client sends its request, signals END_STREAM, and
+    //     waits for the response; HTTP/1.1 servers reply with the full body
+    //     once they see FIN.
     //
-    // Ookla speedtest servers (and many other HTTP/1.1 servers) use keep-alive
-    // and pipeline multiple latency-probe requests over a single TCP connection.
-    // A NaiveProxy / sing-box client sends END_STREAM on its QUIC upload stream
-    // after each logical HTTP request burst, but expects subsequent responses to
-    // keep arriving on the same tunnel.  If we forwarded that END_STREAM as a
-    // TCP FIN, the origin would see "client done writing" and close the
-    // keep-alive connection — breaking the very next ping and producing the
-    // speedtest "Could not connect to the test server" error.
-    //
-    // The half-close timer in relay.rs handles the safety bound:
-    //
-    //   • If the origin had already started sending data before the client
-    //     half-closed (latency ping case), the timer is armed at the short
-    //     UPLINK_HALF_CLOSE_IDLE window (5 s) so silent keep-alive connections
-    //     close promptly instead of stalling for 30 s.
-    //
-    //   • If the origin has not responded yet (download test before headers),
-    //     the timer is armed at uplink_only_timeout (30 s) to allow the server
-    //     time to start streaming the body.  Once data starts flowing, the timer
-    //     resets to UPLINK_HALF_CLOSE_IDLE on every chunk, keeping the relay
-    //     alive for the full transfer.
+    //   • The relay has NO application-level half-close timer.  After EOF on
+    //     one direction we just CloseWrite the peer and wait for natural EOF
+    //     on the other direction (sing-box behaviour).  The QUIC idle timeout
+    //     and the relay's coarse `idle_timeout` are the only safety nets — no
+    //     `half_close_timeout` cuts the response mid-transfer anymore.
     let relay_fut = copy_bidirectional_with_stats(
         padded,
         remote_stream,
@@ -391,7 +380,7 @@ where
         server.conn_config.downlink_only_timeout_secs(),
         server.conn_config.buffer_size,
         Some((user_id, stats)),
-        true,
+        false,
     );
 
     let cancelled = tokio::select! {
