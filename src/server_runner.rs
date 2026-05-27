@@ -116,6 +116,14 @@ pub(crate) fn make_transport_config(cc: &config::CongestionControl) -> quinn::Tr
             .expect("QUIC idle timeout value is valid"),
     ));
     tc.initial_rtt(std::time::Duration::from_millis(QUIC_INITIAL_RTT_MS));
+    // Match sing-box NaiveProxy server: lift the per-connection stream cap so a
+    // browser's speedtest (10+ parallel ookla probes + downloads + lingering
+    // long-idle streams) does not hit quinn's default 100-stream limit, which
+    // would surface as "broken pipe" / stream-rejected errors on new requests.
+    // sing-box uses `MaxIncomingStreams: 1 << 60`; quinn's VarInt::MAX (~2^62)
+    // is the equivalent ceiling.
+    tc.max_concurrent_bidi_streams(quinn::VarInt::MAX);
+    tc.max_concurrent_uni_streams(quinn::VarInt::MAX);
 
     match cc {
         config::CongestionControl::Bbr => {
