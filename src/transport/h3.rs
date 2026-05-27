@@ -95,6 +95,15 @@ where
     // Upload: QUIC recv_data → DuplexStream write → relay reads upstream data.
     // Backpressure: if write_all blocks (relay slow), recv_data is not polled →
     // QUIC receive window exhausts → client self-throttles (correct behaviour).
+    //
+    // Note: we deliberately do NOT drop h3_recv after EOF.  Even though the h3
+    // crate splits the bidirectional stream into independent send/recv halves,
+    // dropping the recv half early appears to interfere with large response
+    // bodies in some clients (observed against the sing-box NaiveProxy H3
+    // client when speedtest.net requested a 25 MB download: only the response
+    // headers ~480 B were ever transferred before the relay stalled).  Holding
+    // h3_recv alive until the bridge task ends costs one QUIC stream slot per
+    // active CONNECT but keeps the send half functional for the full body.
     let upload = tokio::spawn(async move {
         while let Ok(Some(mut data)) = h3_recv.recv_data().await {
             let bytes = data.copy_to_bytes(data.remaining());
@@ -102,10 +111,9 @@ where
                 break;
             }
         }
-        // Release the H3 stream receive slot before the write shutdown so the
-        // connection can accept new streams sooner.
-        drop(h3_recv);
         let _ = io_write.shutdown().await;
+        // Keep h3_recv alive until the task is joined by the caller — see comment above.
+        h3_recv
     });
 
     // Download: DuplexStream read ← relay writes downstream → QUIC send_data.
