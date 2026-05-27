@@ -173,11 +173,13 @@ pub struct CliArgs {
 
     /// After client closes (upload EOF), wait this long for remote to finish.
     ///
-    /// Must be long enough for the remote server to process the request and send
-    /// back a response after the client finishes uploading (e.g. HTTP POST).
-    /// speedtest.net upload typically needs 3–10s for the server to respond;
-    /// 30s provides a safe margin without keeping truly dead connections alive
-    /// (the idle_timeout handles genuinely silent connections).
+    /// After the client closes its upload (TCP half-close / QUIC END_STREAM),
+    /// the relay propagates a FIN to the origin and then waits up to this long
+    /// for the origin to send its response and close.  Needed for HTTP POST
+    /// upload scenarios where the server processes the body before responding
+    /// (e.g. speedtest.net upload typically needs 3–10 s to acknowledge).
+    /// 30 s provides a safe margin; the idle_timeout handles genuinely silent
+    /// connections.
     #[arg(long, env = "X_PANDA_NAIVE_UPLINK_ONLY_TIMEOUT", default_value = "30s", value_parser = parse_duration, help_heading = "Performance")]
     pub uplink_only_timeout: Duration,
 

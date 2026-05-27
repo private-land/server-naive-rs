@@ -357,13 +357,19 @@ where
 {
     let relay_start = std::time::Instant::now();
     let stats = Arc::clone(&server.stats);
-    // suppress_a_to_b_shutdown = true: do not forward a client half-close as a
-    // TCP FIN to the origin server.  Naive/sing-box clients close their QUIC
-    // upload stream (END_STREAM) after sending a proxied GET request; without
-    // this flag the relay would send a TCP FIN to the origin, causing servers
-    // such as ooklaserver (speedtest.net) to return only HTTP headers and skip
-    // the response body, breaking download tests.  The uplink-only timeout
-    // still applies as a safety bound after the client upload closes.
+    // suppress_a_to_b_shutdown = false: propagate client half-close as TCP FIN
+    // to the origin server.  This is the correct behaviour for HTTP CONNECT
+    // tunnelling: when the client (NaiveProxy/sing-box) closes its QUIC upload
+    // stream after sending a proxied request, the relay forwards the half-close
+    // to the origin so that HTTP servers can commit to sending the full response
+    // and then close the connection cleanly.
+    //
+    // Note: an earlier version used suppress=true, based on a flawed `nc -q1`
+    // test that appeared to show ooklaserver truncating responses when a FIN was
+    // received.  Subsequent testing confirmed that ookla sends the full response
+    // body regardless (nc was exiting before the full body arrived, not ookla
+    // truncating).  sing-box naive H3 propagates FIN identically and works
+    // correctly for both latency and download tests.
     let relay_fut = copy_bidirectional_with_stats(
         padded,
         remote_stream,
@@ -372,7 +378,7 @@ where
         server.conn_config.downlink_only_timeout_secs(),
         server.conn_config.buffer_size,
         Some((user_id, stats)),
-        true,
+        false,
     );
 
     let cancelled = tokio::select! {

@@ -540,30 +540,26 @@ mod tests {
 
     // ── TCP half-close / FIN propagation tests ───────────────────────────────
     //
-    // Background (speedtest.net download error on H3/QUIC)
-    // ───────────────────────────────────────────────────
-    // sing-box in H3 mode closes the QUIC upload stream (END_STREAM) after
-    // forwarding the proxied HTTP GET request.  The H3Transport bridge detects
-    // that END_STREAM, calls `io_write.shutdown()`, which propagates as an EOF
-    // through the relay's A→B DirectionalBuffer.  With `suppress_shutdown=false`
-    // the relay then calls `poll_shutdown` on the TCP socket (B writer), sending
-    // a FIN to the origin server.
+    // Background (HTTP CONNECT tunnelling half-close semantics)
+    // ─────────────────────────────────────────────────────────
+    // When a NaiveProxy/sing-box client closes its QUIC upload stream
+    // (END_STREAM) after forwarding a proxied HTTP GET request, the H3Transport
+    // bridge propagates that as an EOF through the relay's A→B DirectionalBuffer.
+    // The relay then calls `poll_shutdown` on the TCP socket (B writer), sending
+    // a TCP FIN to the origin server.
     //
-    // Some servers (notably ooklaserver used by speedtest.net) interpret a FIN
-    // immediately after the request as "client will not read more" and return
-    // only the HTTP response headers without the body (~480 bytes).  The
-    // speedtest client waits 60 s for the 25 MB body, then times out.
+    // This is correct behaviour: HTTP/1.1 servers (including ooklaserver used by
+    // speedtest.net) send the full response body when they receive FIN immediately
+    // after the request.  FIN simply signals "client is done writing"; the server
+    // can still send the full response before closing.
     //
-    // Empirical confirmation on the production server (151.145.91.231):
-    //   printf 'GET /download?size=1000000 …\r\n\r\n' | nc -q1 ooklaserver 8080 | wc -c
-    //   → 57 bytes  (FIN path — relay current behaviour)
-    //
-    //   curl -s -o /dev/null -w '%{size_download}' http://ooklaserver/download?…
-    //   → 1 000 000 bytes  (connection kept open)
-    //
-    // Fix: set `suppress_a_to_b_shutdown = true` when calling the relay from
-    // the CONNECT handler so that a client half-close is not forwarded as a FIN
-    // to the origin server.
+    // Historical note: an earlier version used `suppress_a_to_b_shutdown = true`
+    // based on a flawed `nc -q1` test.  `nc -q1` exits 1 second after stdin EOF,
+    // BEFORE the full body arrives — so only ~57 bytes (headers) were observed.
+    // Re-testing with curl confirmed ookla sends 100 KB when FIN is used.
+    // sing-box naive H3 propagates FIN identically and works for both latency and
+    // download tests; suppress=true caused a 30-second half-close timeout for
+    // each latency ping, breaking the speedtest latency test.
 
     /// `ShutdownRecorder` wraps any `AsyncRead + AsyncWrite` and sets a flag the
     /// moment `poll_shutdown` is called on its write side.  Use it to assert
@@ -601,16 +597,13 @@ mod tests {
         }
     }
 
-    /// RED (documents the current bug):
+    /// Verifies that `suppress_a_to_b_shutdown = false` (the production setting)
+    /// propagates the client's half-close as a TCP FIN to the origin server.
     ///
-    /// When `suppress_a_to_b_shutdown = false`, closing the client upload
-    /// direction causes the relay to call `poll_shutdown` on the server writer.
-    /// This sends a TCP FIN to the origin — servers like ooklaserver respond
-    /// with only HTTP headers, truncating the download.
-    ///
-    /// This test PASSES both before and after the fix, because the default path
-    /// (`suppress=false`) is unchanged.  It acts as a regression guard ensuring
-    /// the suppression flag is wired correctly: when disabled the FIN *is* sent.
+    /// This is the correct and expected behaviour for HTTP CONNECT tunnelling:
+    /// when the client closes its upload stream (QUIC END_STREAM), the relay
+    /// forwards that as a FIN so the origin server knows the client is done
+    /// writing.  HTTP servers then send the full response and close.
     #[tokio::test]
     async fn test_relay_propagates_client_eof_as_fin_when_suppress_disabled() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -671,22 +664,15 @@ mod tests {
         );
     }
 
-    /// GREEN (verifies the fix):
+    /// Verifies the `suppress_a_to_b_shutdown = true` flag mechanics.
     ///
-    /// When `suppress_a_to_b_shutdown = true`, a client half-close does NOT
-    /// send a FIN to the origin server.  The relay marks `a_to_b` as done
-    /// immediately and starts the uplink-only timeout, but leaves the TCP write
-    /// side open so the server can deliver the full response body.
+    /// When suppress=true, a client half-close does NOT send a FIN to the origin.
+    /// The relay marks a_to_b as done immediately and starts the uplink-only
+    /// timeout while the origin server continues sending the response.
     ///
-    /// Scenario mirrors the speedtest.net download flow:
-    ///   1. Client sends GET request then closes its QUIC upload stream.
-    ///   2. Server sends 100 000-byte body (unconditionally — it doesn't know
-    ///      about the FIN that the old code would have sent).
-    ///   3. Relay forwards all bytes to the client.
-    ///   4. Server closes its end → relay delivers EOF to client.
-    ///
-    /// With the fix both assertions hold: no FIN is sent AND the client gets
-    /// the complete download body.
+    /// Note: this flag is NOT used in production (suppress=false is correct for
+    /// HTTP CONNECT tunnelling).  This test documents the flag's contract in case
+    /// it's ever needed for a specific outbound type.
     #[tokio::test]
     async fn test_suppress_flag_prevents_fin_and_delivers_full_download() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
