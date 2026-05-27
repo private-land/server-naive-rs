@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// and this short idle window fires after UPLINK_HALF_CLOSE_IDLE seconds of
 /// silence, closing the relay promptly instead of stalling for the full
 /// `uplink_only_timeout` (default 30 s).
-const UPLINK_HALF_CLOSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+const UPLINK_HALF_CLOSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayTermination {
