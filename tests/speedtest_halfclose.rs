@@ -174,6 +174,7 @@ async fn simulate_speedtest_download(
             downlink_only_secs, // ← 被测参数
             relay_buf,
             None,
+            false, // suppress_a_to_b_shutdown: not needed for these duplex tests
         )
         .await;
         if let Ok(ref r) = r {
@@ -255,6 +256,7 @@ async fn simulate_speedtest_upload(
             60,
             32 * 1024,
             None,
+            false, // suppress_a_to_b_shutdown: not needed for these duplex tests
         )
         .await;
         if let Ok(ref r) = r {

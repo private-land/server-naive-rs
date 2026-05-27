@@ -48,10 +48,21 @@ struct DirectionalBuffer {
     amt: u64,
     read_done: bool,
     shutdown_done: bool,
+    /// When true, skip calling `poll_shutdown` on the writer when the reader
+    /// reaches EOF.  Use this for the A→B direction in CONNECT tunnelling so
+    /// that a client half-close (e.g. QUIC upload END_STREAM after a GET
+    /// request) is *not* forwarded as a TCP FIN to the origin server.
+    ///
+    /// Background: some servers (e.g. ooklaserver used by speedtest.net) return
+    /// only HTTP headers when they receive a request + immediate FIN, because
+    /// they interpret the FIN as "client is done and will not read more".
+    /// Suppressing the FIN lets the server send the full response body while
+    /// the relay still enforces the uplink-only half-close timeout.
+    suppress_shutdown: bool,
 }
 
 impl DirectionalBuffer {
-    fn new(buf_size: usize) -> Self {
+    fn new(buf_size: usize, suppress_shutdown: bool) -> Self {
         Self {
             buf: vec![0u8; buf_size],
             pos: 0,
@@ -59,6 +70,7 @@ impl DirectionalBuffer {
             amt: 0,
             read_done: false,
             shutdown_done: false,
+            suppress_shutdown,
         }
     }
 
@@ -134,7 +146,9 @@ impl DirectionalBuffer {
             }
 
             if self.read_done {
-                let _ = ready!(writer.as_mut().poll_shutdown(cx));
+                if !self.suppress_shutdown {
+                    let _ = ready!(writer.as_mut().poll_shutdown(cx));
+                }
                 self.shutdown_done = true;
                 return Poll::Ready(Ok(()));
             }
@@ -160,13 +174,18 @@ pub async fn copy_bidirectional_with_stats<A, B>(
     downlink_only_secs: u64,
     buffer_size: usize,
     stats: Option<(UserId, Arc<dyn StatsCollector>)>,
+    // When `true`, a half-close from the A (client) side is NOT forwarded as a
+    // TCP FIN to the B (server) side.  Use for CONNECT tunnelling so that a
+    // sing-box / NaiveProxy client closing its QUIC upload stream after a GET
+    // request does not cause origin servers to truncate their response.
+    suppress_a_to_b_shutdown: bool,
 ) -> io::Result<CopyResult>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut a_to_b = DirectionalBuffer::new(buffer_size);
-    let mut b_to_a = DirectionalBuffer::new(buffer_size);
+    let mut a_to_b = DirectionalBuffer::new(buffer_size, suppress_a_to_b_shutdown);
+    let mut b_to_a = DirectionalBuffer::new(buffer_size, false);
 
     let idle_timeout = tokio::time::Duration::from_secs(idle_timeout_secs);
     let uplink_only_timeout = tokio::time::Duration::from_secs(uplink_only_secs);
@@ -284,9 +303,10 @@ mod tests {
         let mut client = Cursor::new(data.to_vec());
         let mut remote = Cursor::new(Vec::new());
 
-        let result = copy_bidirectional_with_stats(&mut client, &mut remote, 300, 2, 5, 1024, None)
-            .await
-            .unwrap();
+        let result =
+            copy_bidirectional_with_stats(&mut client, &mut remote, 300, 2, 5, 1024, None, false)
+                .await
+                .unwrap();
 
         assert!(result.completed);
         assert!(result.a_to_b > 0);
@@ -327,7 +347,7 @@ mod tests {
         let mut remote = NeverEofSink;
 
         let result =
-            copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1, 100, 1024, None)
+            copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1, 100, 1024, None, false)
                 .await
                 .unwrap();
 
@@ -341,7 +361,7 @@ mod tests {
         let mut remote = NeverEofSink;
 
         let result =
-            copy_bidirectional_with_stats(&mut client, &mut remote, 3, 100, 100, 1024, None)
+            copy_bidirectional_with_stats(&mut client, &mut remote, 3, 100, 100, 1024, None, false)
                 .await
                 .unwrap();
 
@@ -382,6 +402,7 @@ mod tests {
             5,
             1024,
             Some((1, Arc::clone(&collector) as Arc<dyn StatsCollector>)),
+            false,
         )
         .await
         .unwrap();
@@ -459,7 +480,7 @@ mod tests {
             let mut b = PendingFlushWriter;
             copy_bidirectional_with_stats(
                 &mut a, &mut b, 1, // idle_timeout = 1 s
-                10, 10, 1024, None,
+                10, 10, 1024, None, false,
             )
             .await
         });
@@ -504,5 +525,235 @@ mod tests {
         );
 
         relay.abort();
+    }
+
+    // ── TCP half-close / FIN propagation tests ───────────────────────────────
+    //
+    // Background (speedtest.net download error on H3/QUIC)
+    // ───────────────────────────────────────────────────
+    // sing-box in H3 mode closes the QUIC upload stream (END_STREAM) after
+    // forwarding the proxied HTTP GET request.  The H3Transport bridge detects
+    // that END_STREAM, calls `io_write.shutdown()`, which propagates as an EOF
+    // through the relay's A→B DirectionalBuffer.  With `suppress_shutdown=false`
+    // the relay then calls `poll_shutdown` on the TCP socket (B writer), sending
+    // a FIN to the origin server.
+    //
+    // Some servers (notably ooklaserver used by speedtest.net) interpret a FIN
+    // immediately after the request as "client will not read more" and return
+    // only the HTTP response headers without the body (~480 bytes).  The
+    // speedtest client waits 60 s for the 25 MB body, then times out.
+    //
+    // Empirical confirmation on the production server (151.145.91.231):
+    //   printf 'GET /download?size=1000000 …\r\n\r\n' | nc -q1 ooklaserver 8080 | wc -c
+    //   → 57 bytes  (FIN path — relay current behaviour)
+    //
+    //   curl -s -o /dev/null -w '%{size_download}' http://ooklaserver/download?…
+    //   → 1 000 000 bytes  (connection kept open)
+    //
+    // Fix: set `suppress_a_to_b_shutdown = true` when calling the relay from
+    // the CONNECT handler so that a client half-close is not forwarded as a FIN
+    // to the origin server.
+
+    /// `ShutdownRecorder` wraps any `AsyncRead + AsyncWrite` and sets a flag the
+    /// moment `poll_shutdown` is called on its write side.  Use it to assert
+    /// whether the relay propagated a client EOF as a FIN to the server.
+    struct ShutdownRecorder<T> {
+        inner: T,
+        shutdown_called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for ShutdownRecorder<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for ShutdownRecorder<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdown_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// RED (documents the current bug):
+    ///
+    /// When `suppress_a_to_b_shutdown = false`, closing the client upload
+    /// direction causes the relay to call `poll_shutdown` on the server writer.
+    /// This sends a TCP FIN to the origin — servers like ooklaserver respond
+    /// with only HTTP headers, truncating the download.
+    ///
+    /// This test PASSES both before and after the fix, because the default path
+    /// (`suppress=false`) is unchanged.  It acts as a regression guard ensuring
+    /// the suppression flag is wired correctly: when disabled the FIN *is* sent.
+    #[tokio::test]
+    async fn test_relay_propagates_client_eof_as_fin_when_suppress_disabled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut a_relay, a_client) = tokio::io::duplex(8192);
+        let (b_inner, mut b_server) = tokio::io::duplex(8192);
+
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let mut b_relay = ShutdownRecorder {
+            inner: b_inner,
+            shutdown_called: shutdown_called.clone(),
+        };
+
+        // Client: write a GET-like request, then close the upload direction.
+        // This mirrors sing-box H3 behaviour: upload stream END_STREAM fires
+        // after the request body is sent.
+        let client_task = tokio::spawn(async move {
+            let (mut cr, mut cw) = tokio::io::split(a_client);
+            cw.write_all(b"GET /download HTTP/1.1\r\nHost: test\r\n\r\n")
+                .await
+                .unwrap();
+            cw.shutdown().await.unwrap(); // half-close upload only
+                                          // Keep reading so the relay can write the (empty) server response
+                                          // and complete normally without hitting a downlink-only timeout.
+            let mut buf = Vec::new();
+            cr.read_to_end(&mut buf).await.ok();
+        });
+
+        // Server: read the request then immediately close — no response body.
+        // We only care whether the relay called poll_shutdown on b_relay, not
+        // about what the server sends.
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 256];
+            let _ = b_server.read(&mut buf).await;
+            // drop b_server → EOF on b_relay read side → relay b_to_a completes
+        });
+
+        let _ = copy_bidirectional_with_stats(
+            &mut a_relay,
+            &mut b_relay,
+            5, // idle_timeout
+            5, // uplink_only_timeout
+            5, // downlink_only_timeout
+            4096,
+            None,
+            false, // suppress_a_to_b_shutdown = false → relay DOES send FIN
+        )
+        .await;
+
+        client_task.await.unwrap();
+        server_task.await.unwrap();
+
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "suppress=false: relay must call poll_shutdown on the server writer \
+             when the client closes its upload direction (FIN propagated)"
+        );
+    }
+
+    /// GREEN (verifies the fix):
+    ///
+    /// When `suppress_a_to_b_shutdown = true`, a client half-close does NOT
+    /// send a FIN to the origin server.  The relay marks `a_to_b` as done
+    /// immediately and starts the uplink-only timeout, but leaves the TCP write
+    /// side open so the server can deliver the full response body.
+    ///
+    /// Scenario mirrors the speedtest.net download flow:
+    ///   1. Client sends GET request then closes its QUIC upload stream.
+    ///   2. Server sends 100 000-byte body (unconditionally — it doesn't know
+    ///      about the FIN that the old code would have sent).
+    ///   3. Relay forwards all bytes to the client.
+    ///   4. Server closes its end → relay delivers EOF to client.
+    ///
+    /// With the fix both assertions hold: no FIN is sent AND the client gets
+    /// the complete download body.
+    #[tokio::test]
+    async fn test_suppress_flag_prevents_fin_and_delivers_full_download() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const BODY: &[u8] = &[b'X'; 100_000];
+        const HEADER: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n";
+        let expected: u64 = (HEADER.len() + BODY.len()) as u64;
+
+        let (mut a_relay, a_client) = tokio::io::duplex(8192);
+        let (b_inner, b_server) = tokio::io::duplex(128 * 1024);
+
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let mut b_relay = ShutdownRecorder {
+            inner: b_inner,
+            shutdown_called: shutdown_called.clone(),
+        };
+
+        // Mock origin server: receives the GET request, sends the full body,
+        // then closes.  It does not check for FIN — just like a server that
+        // always sends the response once it has read the request headers.
+        let server_task = tokio::spawn(async move {
+            let mut b = b_server;
+            let mut req = vec![0u8; 256];
+            let _ = b.read(&mut req).await; // consume the GET request
+            b.write_all(HEADER).await.unwrap();
+            b.write_all(BODY).await.unwrap();
+            b.shutdown().await.unwrap(); // server closes after sending body
+        });
+
+        // Client: simulates sing-box H3 — sends GET, closes upload direction,
+        // then reads the download body until EOF.
+        let received = Arc::new(AtomicU64::new(0));
+        let received_clone = received.clone();
+        let client_task = tokio::spawn(async move {
+            let (mut cr, mut cw) = tokio::io::split(a_client);
+            cw.write_all(b"GET /download HTTP/1.1\r\nHost: test\r\n\r\n")
+                .await
+                .unwrap();
+            cw.shutdown().await.unwrap(); // upload END_STREAM
+            let mut buf = Vec::new();
+            cr.read_to_end(&mut buf).await.ok();
+            received_clone.store(buf.len() as u64, Ordering::Relaxed);
+        });
+
+        let r = copy_bidirectional_with_stats(
+            &mut a_relay,
+            &mut b_relay,
+            60, // idle_timeout: generous — server is fast in tests
+            30, // uplink_only_timeout: time allowed for server to respond after
+            // client closes upload (must be > 0 to let server finish)
+            30, // downlink_only_timeout
+            4096,
+            None,
+            true, // suppress_a_to_b_shutdown = true → do NOT send FIN to server
+        )
+        .await
+        .unwrap();
+
+        server_task.await.unwrap();
+        client_task.await.unwrap();
+
+        // 1. FIN must NOT have been propagated to the origin server.
+        assert!(
+            !shutdown_called.load(Ordering::SeqCst),
+            "suppress=true: relay must NOT call poll_shutdown on the server writer \
+             when the client closes its upload direction"
+        );
+
+        // 2. Client must have received the complete download body.
+        assert_eq!(
+            received.load(Ordering::Relaxed),
+            expected,
+            "client must receive the full {expected}-byte download body \
+             (header + body) when FIN propagation is suppressed; \
+             relay stats: a_to_b={}, b_to_a={}",
+            r.a_to_b,
+            r.b_to_a,
+        );
     }
 }
