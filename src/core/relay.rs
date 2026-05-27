@@ -9,6 +9,18 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
+/// After the server starts sending data during an uplink-only half-close
+/// (client upload closed, suppress=true so no FIN was sent), how long to
+/// wait after the *last* byte from the server before closing the relay.
+///
+/// This is intentionally shorter than uplink_only_timeout (which governs
+/// the wait *before* the server responds).  Once the server has started
+/// responding, a short silence window is sufficient: active downloads keep
+/// arriving continuously so the timer resets on every chunk, while latency-
+/// test connections (one small response, then keep-alive silence) close
+/// cleanly after this idle period instead of stalling for 30 seconds.
+const UPLINK_HALF_CLOSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayTermination {
     Completed,
@@ -246,14 +258,32 @@ where
                 .reset(tokio::time::Instant::now() + idle_timeout);
         }
 
-        // When in uplink-only half-close (client closed, server still sending),
-        // reset the half-close timer on each burst of downlink data so that a
-        // slow-but-active download is not cut off by uplink_only_timeout.
-        // The idle_timeout still fires if the server goes completely silent.
+        // When in uplink-only half-close (client closed upload, server still sending),
+        // reset the half-close timer to a short idle window on each burst of downlink
+        // data.  Two purposes:
+        //
+        // 1. Downloads (suppress=true): client closes QUIC upload stream after GET;
+        //    server continuously sends chunks.  As long as chunks arrive within
+        //    UPLINK_HALF_CLOSE_IDLE seconds of each other the timer keeps resetting,
+        //    so the download is never cut off mid-transfer.
+        //
+        // 2. Latency / short requests: after the server sends its small response and
+        //    goes quiet (HTTP keep-alive — TCP stays open), the timer fires after
+        //    UPLINK_HALF_CLOSE_IDLE seconds of silence, closing the relay promptly.
+        //    Without this, the relay would stall for the full uplink_only_timeout
+        //    (30 s) on every latency ping, making speedtest.net report an error.
+        //
+        // NOTE: we intentionally do NOT reset to uplink_only_timeout here.  The
+        // uplink_only_timeout is only used for the *initial* arm (server hasn't
+        // responded yet).  Once the server starts sending, a short idle window is
+        // correct and safe.
         if half_close_active && b_progress {
+            // Use the shorter of uplink_only_timeout and the idle window, so that
+            // a custom very-short uplink_only_timeout is still respected.
+            let idle = uplink_only_timeout.min(UPLINK_HALF_CLOSE_IDLE);
             half_close_sleep
                 .as_mut()
-                .reset(tokio::time::Instant::now() + uplink_only_timeout);
+                .reset(tokio::time::Instant::now() + idle);
         }
 
         if a_to_b.is_done() && b_to_a.is_done() {

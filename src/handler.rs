@@ -357,19 +357,31 @@ where
 {
     let relay_start = std::time::Instant::now();
     let stats = Arc::clone(&server.stats);
-    // suppress_a_to_b_shutdown = false: propagate client half-close as TCP FIN
-    // to the origin server.  This is the correct behaviour for HTTP CONNECT
-    // tunnelling: when the client (NaiveProxy/sing-box) closes its QUIC upload
-    // stream after sending a proxied request, the relay forwards the half-close
-    // to the origin so that HTTP servers can commit to sending the full response
-    // and then close the connection cleanly.
+    // suppress_a_to_b_shutdown = true: do NOT forward a client half-close as a
+    // TCP FIN to the origin server.
     //
-    // Note: an earlier version used suppress=true, based on a flawed `nc -q1`
-    // test that appeared to show ooklaserver truncating responses when a FIN was
-    // received.  Subsequent testing confirmed that ookla sends the full response
-    // body regardless (nc was exiting before the full body arrived, not ookla
-    // truncating).  sing-box naive H3 propagates FIN identically and works
-    // correctly for both latency and download tests.
+    // Why suppress=true is required for H3/QUIC → TCP tunnelling:
+    //
+    // NaiveProxy / sing-box clients send END_STREAM on the QUIC upload direction
+    // after forwarding a proxied HTTP request (e.g. a GET for speedtest download
+    // or a POST for speedtest upload).  Without suppression the relay would
+    // immediately send a TCP FIN to the origin server.  ooklaserver (and similar
+    // HTTP servers operating in "connection: close" mode) interpret an immediate
+    // FIN as "client will not read the response body" and return only the HTTP
+    // response headers (~57 bytes), discarding the body.  This breaks download
+    // and upload speed tests.
+    //
+    // The uplink-only half-close timeout still applies as a safety bound.  Its
+    // initial arm (uplink_only_timeout, 30 s) gives the origin time to start
+    // responding; once the origin sends its first bytes the timer resets to the
+    // shorter UPLINK_HALF_CLOSE_IDLE window (5 s of silence).  This means:
+    //
+    //   • Active downloads: origin keeps sending chunks → timer resets every
+    //     <5 s → relay stays alive for the full transfer.
+    //
+    //   • Latency pings: origin sends a small response then keeps the TCP
+    //     connection open (keep-alive).  After 5 s of silence the relay closes,
+    //     avoiding the 30-second stall that previously broke latency tests.
     let relay_fut = copy_bidirectional_with_stats(
         padded,
         remote_stream,
@@ -378,7 +390,7 @@ where
         server.conn_config.downlink_only_timeout_secs(),
         server.conn_config.buffer_size,
         Some((user_id, stats)),
-        false,
+        true,
     );
 
     let cancelled = tokio::select! {
