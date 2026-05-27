@@ -166,6 +166,7 @@ impl DirectionalBuffer {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // all 8 params are distinct knobs; a config struct is a future refactor
 pub async fn copy_bidirectional_with_stats<A, B>(
     a: &mut A,
     b: &mut B,
