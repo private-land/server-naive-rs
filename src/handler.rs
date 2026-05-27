@@ -357,6 +357,21 @@ where
 {
     let relay_start = std::time::Instant::now();
     let stats = Arc::clone(&server.stats);
+    // suppress_a_to_b_shutdown = false: propagate the client's half-close to
+    // the origin via TCP FIN.  This matches sing-box's NaiveProxy server design
+    // (its `CopyConn` calls `N.CloseWrite` on the destination once the source
+    // reaches EOF) and is necessary for HTTP/1.1 + ooklaserver speedtest:
+    //
+    //   • Latency / download / upload all use one CONNECT tunnel per logical
+    //     HTTP request.  The client sends its request, signals END_STREAM, and
+    //     waits for the response; HTTP/1.1 servers reply with the full body
+    //     once they see FIN.
+    //
+    //   • The relay has NO application-level half-close timer.  After EOF on
+    //     one direction we just CloseWrite the peer and wait for natural EOF
+    //     on the other direction (sing-box behaviour).  The QUIC idle timeout
+    //     and the relay's coarse `idle_timeout` are the only safety nets — no
+    //     `half_close_timeout` cuts the response mid-transfer anymore.
     let relay_fut = copy_bidirectional_with_stats(
         padded,
         remote_stream,
@@ -365,6 +380,7 @@ where
         server.conn_config.downlink_only_timeout_secs(),
         server.conn_config.buffer_size,
         Some((user_id, stats)),
+        false,
     );
 
     let cancelled = tokio::select! {
