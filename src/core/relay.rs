@@ -9,16 +9,19 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
-/// After the server starts sending data during an uplink-only half-close
-/// (client upload closed, suppress=true so no FIN was sent), how long to
-/// wait after the *last* byte from the server before closing the relay.
+/// Half-close idle window: how long to wait after the *last* byte from the
+/// origin server, once the client has half-closed its upload direction (relay
+/// is in uplink-only half-close state).
 ///
-/// This is intentionally shorter than uplink_only_timeout (which governs
-/// the wait *before* the server responds).  Once the server has started
-/// responding, a short silence window is sufficient: active downloads keep
-/// arriving continuously so the timer resets on every chunk, while latency-
-/// test connections (one small response, then keep-alive silence) close
-/// cleanly after this idle period instead of stalling for 30 seconds.
+/// Normal path (Connection: close): the origin sends its response body + FIN.
+/// The relay's b_to_a direction reaches EOF and both sides complete with
+/// `Completed` — this timer never fires for well-behaved origins.
+///
+/// Safety net path (Connection: keep-alive): the origin sends its response
+/// but holds the TCP connection open.  In that case half_close remains active
+/// and this short idle window fires after UPLINK_HALF_CLOSE_IDLE seconds of
+/// silence, closing the relay promptly instead of stalling for the full
+/// `uplink_only_timeout` (default 30 s).
 const UPLINK_HALF_CLOSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,25 +261,18 @@ where
                 .reset(tokio::time::Instant::now() + idle_timeout);
         }
 
-        // When in uplink-only half-close (client closed upload, server still sending),
-        // reset the half-close timer to a short idle window on each burst of downlink
-        // data.  Two purposes:
+        // Safety net for keep-alive origins: when in uplink-only half-close and
+        // the origin is sending data (Connection: keep-alive, no FIN), refresh
+        // the timer to a short idle window on every burst of downlink data.
         //
-        // 1. Downloads (suppress=true): client closes QUIC upload stream after GET;
-        //    server continuously sends chunks.  As long as chunks arrive within
-        //    UPLINK_HALF_CLOSE_IDLE seconds of each other the timer keeps resetting,
-        //    so the download is never cut off mid-transfer.
+        // Well-behaved origins (Connection: close) send FIN after the response;
+        // b_to_a reaches EOF and the relay completes normally — this branch is
+        // not reached for them.
         //
-        // 2. Latency / short requests: after the server sends its small response and
-        //    goes quiet (HTTP keep-alive — TCP stays open), the timer fires after
-        //    UPLINK_HALF_CLOSE_IDLE seconds of silence, closing the relay promptly.
-        //    Without this, the relay would stall for the full uplink_only_timeout
-        //    (30 s) on every latency ping, making speedtest.net report an error.
-        //
-        // NOTE: we intentionally do NOT reset to uplink_only_timeout here.  The
-        // uplink_only_timeout is only used for the *initial* arm (server hasn't
-        // responded yet).  Once the server starts sending, a short idle window is
-        // correct and safe.
+        // For keep-alive origins: each arriving chunk resets the timer so active
+        // transfers are never cut short; once the origin goes silent the relay
+        // closes after UPLINK_HALF_CLOSE_IDLE instead of the full
+        // uplink_only_timeout (default 30 s).
         if half_close_active && b_progress {
             // Use the shorter of uplink_only_timeout and the idle window, so that
             // a custom very-short uplink_only_timeout is still respected.
