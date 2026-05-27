@@ -91,6 +91,14 @@ const QUIC_KEEPALIVE_INTERVAL_SECS: u64 = 20;
 /// Capped conservatively at 2 minutes to match typical NAT/middlebox limits.
 const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 120;
 
+/// Initial RTT estimate for QUIC connections.
+///
+/// Quinn's spec-mandated default is 333 ms, which is intentionally conservative.
+/// For proxy use-cases (international links, 50-200 ms actual RTT) a lower value
+/// gives faster initial pacing without sacrificing correctness — the real RTT is
+/// measured after the first round-trip and used from then on.
+const QUIC_INITIAL_RTT_MS: u64 = 100;
+
 /// Run the Naive server accept loop.
 pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Result<()> {
     use tokio::sync::Semaphore;
@@ -285,6 +293,15 @@ pub async fn run_h3_server(server: Arc<Server>, config: &config::ServerConfig) -
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(QUIC_MAX_IDLE_TIMEOUT_SECS))
             .expect("QUIC idle timeout value is valid"),
     ));
+    transport_config.initial_rtt(std::time::Duration::from_millis(QUIC_INITIAL_RTT_MS));
+    // Match sing-box NaiveProxy server: lift the per-connection stream cap so a
+    // browser's speedtest (10+ parallel ookla probes + downloads + lingering
+    // long-idle streams) does not hit quinn's default 100-stream limit, which
+    // would surface as "broken pipe" / stream-rejected errors on new requests.
+    // sing-box uses `MaxIncomingStreams: 1 << 60`; quinn's VarInt::MAX (~2^62)
+    // is the equivalent ceiling.
+    transport_config.max_concurrent_bidi_streams(quinn::VarInt::MAX);
+    transport_config.max_concurrent_uni_streams(quinn::VarInt::MAX);
 
     let mut quinn_server = quinn::ServerConfig::with_crypto(Arc::new(quinn_crypto));
     quinn_server.transport_config(Arc::new(transport_config));

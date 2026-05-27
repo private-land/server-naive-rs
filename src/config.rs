@@ -133,8 +133,13 @@ pub struct CliArgs {
     pub panel_ip_version: IpVersion,
 
     // ==================== Performance Tuning ====================
-    /// Connection idle timeout
-    #[arg(long, env = "X_PANDA_NAIVE_CONN_IDLE_TIMEOUT", default_value = "5m", value_parser = parse_duration, help_heading = "Performance")]
+    /// Connection idle timeout — fires only when BOTH relay directions have
+    /// gone silent for the full window.  Lowered from 5 min to 60 s to align
+    /// with sing-box (which has no app-level idle and relies on QUIC's 30 s
+    /// transport idle); a generous 2× QUIC idle keeps long-tail keep-alive
+    /// idle from being cut prematurely while preventing 5-min lingering
+    /// streams from piling up across rapid speedtest re-runs.
+    #[arg(long, env = "X_PANDA_NAIVE_CONN_IDLE_TIMEOUT", default_value = "60s", value_parser = parse_duration, help_heading = "Performance")]
     pub conn_idle_timeout: Duration,
 
     /// TCP connect timeout to target server

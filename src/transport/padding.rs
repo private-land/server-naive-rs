@@ -142,30 +142,31 @@ impl<T: AsyncRead + Unpin> AsyncRead for NaivePaddedTransport<T> {
                 if buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
                 }
-                if buf.remaining() >= this.read_data_rem {
-                    // Caller's buffer is larger — must limit to avoid consuming
+                let n = if buf.remaining() > this.read_data_rem {
+                    // Caller's buffer is larger — limit to avoid consuming
                     // the next frame's header/padding bytes.
-                    let chunk = this.read_data_rem.min(4096);
-                    let mut scratch = [0u8; 4096];
-                    let mut sbuf = ReadBuf::new(&mut scratch[..chunk]);
-                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut sbuf))?;
-                    let n = sbuf.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Ok(())); // EOF
+                    // buf.take() shares the parent buffer's memory: zero-copy, no size cap.
+                    // Mirrors the pattern in tokio's own Take::poll_read.
+                    let mut limited = buf.take(this.read_data_rem);
+                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut limited))?;
+                    let n = limited.filled().len();
+                    if n > 0 {
+                        // Safety: `limited` was backed by the unfilled portion of `buf`;
+                        // those `n` bytes were written there and are now initialised.
+                        unsafe { buf.assume_init(n) };
+                        buf.advance(n);
                     }
-                    buf.put_slice(&scratch[..n]);
-                    this.read_data_rem -= n;
+                    n
                 } else {
-                    // Caller's buffer is smaller — safe to read directly (won't
-                    // overshoot the frame boundary).
+                    // buf.remaining() <= read_data_rem: can't overshoot the frame boundary.
                     let before = buf.filled().len();
                     ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
-                    let n = buf.filled().len() - before;
-                    if n == 0 {
-                        return Poll::Ready(Ok(())); // EOF
-                    }
-                    this.read_data_rem -= n;
+                    buf.filled().len() - before
+                };
+                if n == 0 {
+                    return Poll::Ready(Ok(())); // EOF
                 }
+                this.read_data_rem -= n;
                 if this.read_data_rem == 0 {
                     this.read_skip_rem = this.read_pending_skip;
                     this.read_pending_skip = 0;
@@ -329,6 +330,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for NaivePaddedTransport<T> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Drain any buffered padded frame before shutting down; otherwise bytes
+        // still in write_pending would be silently dropped.
+        ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -463,5 +467,331 @@ mod tests {
         // Not all the same (astronomically unlikely to fail)
         let all_same = vals.windows(2).all(|w| w[0] == w[1]);
         assert!(!all_same, "PRNG appears stuck");
+    }
+
+    /// Regression for the `poll_shutdown` data-loss bug: when the inner transport
+    /// is slow (4-byte capacity), `write_all` leaves frame bytes in `write_pending`.
+    /// Before the fix, `shutdown()` skipped flushing them and the receiver lost data.
+    #[tokio::test]
+    async fn test_poll_shutdown_flushes_write_pending() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 4-byte capacity forces the padded frame (≥8 bytes) into write_pending.
+        let (a, b) = tokio::io::duplex(4);
+        let mut enc = NaivePaddedTransport::new(a);
+
+        // Drain concurrently so writes don't deadlock.
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = [0u8; 512];
+            let mut b = b;
+            loop {
+                let n = b.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        });
+
+        enc.write_all(b"hello").await.unwrap();
+        enc.shutdown().await.unwrap(); // must flush leftover frame bytes
+
+        let on_wire = reader.await.unwrap();
+        // minimum frame = 3 B header + 5 B data + 0 B padding = 8 bytes
+        assert!(
+            on_wire >= 8,
+            "shutdown lost bytes: got {on_wire} on wire, expected ≥8"
+        );
+    }
+
+    // ── Encode / decode roundtrip tests ──────────────────────────────────────────
+    //
+    // These tests connect two `NaivePaddedTransport` instances back-to-back over
+    // a `tokio::io::duplex` pipe.  One side encodes (writes padded frames) and the
+    // other decodes (strips framing and returns original bytes).
+
+    /// Single-frame encode→decode: the simplest possible roundtrip.
+    #[tokio::test]
+    async fn test_roundtrip_single_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (a, b) = tokio::io::duplex(1024 * 1024);
+        let mut enc = NaivePaddedTransport::new(a);
+        let mut dec = NaivePaddedTransport::new(b);
+
+        let original: &[u8] = b"hello naive proxy roundtrip";
+        enc.write_all(original).await.unwrap();
+        enc.shutdown().await.unwrap();
+
+        let mut decoded = Vec::new();
+        dec.read_to_end(&mut decoded).await.unwrap();
+
+        assert_eq!(decoded, original);
+    }
+
+    /// Eight padded frames (indices 0-7) plus one raw frame (index 8) must all
+    /// decode to the original bytes.
+    ///
+    /// Both encoder (write_frames_done) and decoder (read_frames_done)
+    /// independently count to 8 and then switch to raw passthrough — they stay
+    /// in sync because the framed bytes on the wire change at the same boundary.
+    #[tokio::test]
+    async fn test_roundtrip_nine_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (a, b) = tokio::io::duplex(4 * 1024 * 1024);
+        let mut enc = NaivePaddedTransport::new(a);
+        let mut dec = NaivePaddedTransport::new(b);
+
+        const CHUNK: usize = 128;
+        let mut expected = Vec::new();
+
+        for i in 0u8..9 {
+            let chunk = vec![i; CHUNK];
+            expected.extend_from_slice(&chunk);
+            enc.write_all(&chunk).await.unwrap();
+        }
+        enc.shutdown().await.unwrap();
+
+        let mut decoded = Vec::new();
+        dec.read_to_end(&mut decoded).await.unwrap();
+
+        assert_eq!(
+            decoded, expected,
+            "all 9 frames (8 padded + 1 raw) must decode correctly"
+        );
+    }
+
+    /// A→B and B→A are encoded / decoded independently.
+    /// Each side maintains its own frame counters so the two directions
+    /// never interfere with each other.
+    #[tokio::test]
+    async fn test_roundtrip_bidirectional() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (a, b) = tokio::io::duplex(4 * 1024 * 1024);
+        let mut ta = NaivePaddedTransport::new(a);
+        let mut tb = NaivePaddedTransport::new(b);
+
+        let a_to_b: &[u8] = b"transport A sends this";
+        let b_to_a: &[u8] = b"transport B sends this";
+
+        // A→B
+        ta.write_all(a_to_b).await.unwrap();
+        let mut buf = vec![0u8; a_to_b.len()];
+        tb.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, a_to_b, "A→B data mismatch");
+
+        // B→A
+        tb.write_all(b_to_a).await.unwrap();
+        let mut buf = vec![0u8; b_to_a.len()];
+        ta.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b_to_a, "B→A data mismatch");
+    }
+
+    /// Data arriving one byte at a time still decodes correctly.
+    ///
+    /// Exercises the partial-header accumulation path (read_hdr_pos advances
+    /// 0→1→2→3 across separate poll_read calls) and the partial-data path
+    /// (read_data_rem decrements one byte at a time).
+    #[tokio::test]
+    async fn test_decode_byte_by_byte_arrival() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let original: &[u8] = b"byte-by-byte decoding";
+        let pad_size: u8 = 4;
+
+        // Build one raw padded frame manually: [u16 BE data_len][u8 pad_size][data][pad]
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(original.len() as u16).to_be_bytes());
+        frame.push(pad_size);
+        frame.extend_from_slice(original);
+        frame.extend(std::iter::repeat_n(0xAA, pad_size as usize));
+
+        // Feed the encoded frame into the decoder one byte at a time via a spawn.
+        let (tx, rx) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut w = tx;
+            for byte in &frame {
+                w.write_all(&[*byte]).await.unwrap();
+            }
+            w.shutdown().await.unwrap();
+        });
+
+        let mut dec = NaivePaddedTransport::new(rx);
+        let mut decoded = Vec::new();
+        dec.read_to_end(&mut decoded).await.unwrap();
+
+        assert_eq!(decoded, original);
+    }
+
+    /// read_data_rem path where caller's buffer is larger than one frame:
+    /// data is delivered without reading past the frame boundary into the
+    /// next header.
+    #[tokio::test]
+    async fn test_roundtrip_small_frame_large_read_buf() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (a, b) = tokio::io::duplex(1024 * 1024);
+        let mut enc = NaivePaddedTransport::new(a);
+        let mut dec = NaivePaddedTransport::new(b);
+
+        // Two small frames written sequentially; read with a buffer bigger than both.
+        let frame1: &[u8] = b"first";
+        let frame2: &[u8] = b"second";
+
+        enc.write_all(frame1).await.unwrap();
+        enc.write_all(frame2).await.unwrap();
+        enc.shutdown().await.unwrap();
+
+        // Use a 4 KB buffer — much larger than either frame.
+        let mut buf = vec![0u8; 4096];
+        let mut decoded = Vec::new();
+        loop {
+            let n = dec.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&buf[..n]);
+        }
+
+        let mut expected = frame1.to_vec();
+        expected.extend_from_slice(frame2);
+        assert_eq!(decoded, expected);
+    }
+
+    // ── Phase 1 scratch-buffer regression tests ───────────────────────────────
+
+    /// RED → GREEN: Phase 1 must deliver the entire frame in a single poll_read
+    /// when the caller's buffer is large enough.
+    ///
+    /// BUG (scratch buffer): poll_read limited each read to
+    ///   `min(read_data_rem, 4096)` bytes.  For a 32 KB frame with a 64 KB
+    ///   caller buffer, only 4096 bytes were returned per call.
+    ///
+    /// FIX (buf.take): reads up to `read_data_rem` bytes directly into the
+    ///   caller's buffer — all 32 KB in one call.
+    ///
+    /// Assertion: a single `read` on a pre-filled 32 KB frame returns > 4096 bytes.
+    #[tokio::test]
+    async fn red_phase1_large_frame_not_capped_at_4096() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const DATA_SIZE: usize = 32 * 1024; // 32 KB > 4096
+
+        // Build one raw padded frame manually: [u16 BE data_len][u8 pad=0][data]
+        let mut frame = Vec::with_capacity(3 + DATA_SIZE);
+        frame.extend_from_slice(&(DATA_SIZE as u16).to_be_bytes());
+        frame.push(0u8);
+        frame.extend(std::iter::repeat_n(0xABu8, DATA_SIZE));
+
+        // 1 MB pipe ensures all frame bytes are available before first read.
+        let (tx, rx) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            let mut w = tx;
+            w.write_all(&frame).await.unwrap();
+            w.shutdown().await.unwrap();
+        });
+
+        let mut dec = NaivePaddedTransport::new(rx);
+
+        // Buffer is LARGER than the frame so poll_read hits the "limit" branch.
+        let mut buf = vec![0u8; DATA_SIZE * 2];
+        let n = dec.read(&mut buf).await.unwrap();
+
+        // BUG: old code returns exactly 4096 bytes; fix returns the full 32 KB.
+        assert!(
+            n > 4096,
+            "poll_read must return more than 4096 bytes from a 32 KB frame \
+             in one call (old scratch-buffer bug returned exactly 4096); got {n}"
+        );
+    }
+
+    /// RED → GREEN: total inner poll_read calls to consume one 32 KB frame
+    /// must be far fewer with the fix than with the scratch-buffer bug.
+    ///
+    /// BUG: scratch buffer caps each Phase 1 read at 4 096 bytes.
+    ///   To consume 32 768 bytes of frame data: ⌈32768/4096⌉ = 8 data reads.
+    ///   Plus 1 header read + 1 initial Pending = 10 inner reads total.
+    ///
+    /// FIX (buf.take): one Phase 1 read delivers the entire 32 KB frame.
+    ///   1 header read + 1 data read + 1 initial Pending = 3 inner reads total.
+    ///
+    /// Threshold: ≤ 4 inner reads separates fix (3) from bug (10).
+    #[tokio::test]
+    async fn red_phase1_large_frame_inner_read_count() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncReadExt, ReadBuf};
+
+        struct CountingReader<R> {
+            inner: R,
+            calls: std::sync::Arc<AtomicUsize>,
+        }
+        impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingReader<R> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        const DATA_SIZE: usize = 32 * 1024;
+
+        let mut frame = Vec::with_capacity(3 + DATA_SIZE);
+        frame.extend_from_slice(&(DATA_SIZE as u16).to_be_bytes());
+        frame.push(0u8);
+        frame.extend(std::iter::repeat_n(0xCDu8, DATA_SIZE));
+
+        let (tx, rx) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            let mut w = tx;
+            tokio::io::AsyncWriteExt::write_all(&mut w, &frame)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::shutdown(&mut w).await.unwrap();
+        });
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader {
+            inner: rx,
+            calls: calls.clone(),
+        };
+        let mut dec = NaivePaddedTransport::new(counting);
+        let mut buf = vec![0u8; DATA_SIZE * 2];
+
+        // Consume the full frame, accumulating inner-read counts across all outer reads.
+        let mut total_consumed = 0usize;
+        loop {
+            let n = dec.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total_consumed += n;
+            if total_consumed >= DATA_SIZE {
+                break;
+            }
+        }
+        let total_inner_reads = calls.load(Ordering::SeqCst);
+
+        assert_eq!(
+            total_consumed, DATA_SIZE,
+            "must consume exactly {DATA_SIZE} bytes"
+        );
+
+        // Fix: 1 Pending + 1 header + 1 data = 3 inner reads.
+        // Bug: 1 Pending + 1 header + 8 data = 10 inner reads.
+        // Threshold 5 clearly separates fix (≤4) from bug (≥10).
+        assert!(
+            total_inner_reads <= 5,
+            "total inner reads to consume {DATA_SIZE} bytes should be ≤5 with fix \
+             (old scratch-buffer bug needed ≥10); got {total_inner_reads}"
+        );
     }
 }
