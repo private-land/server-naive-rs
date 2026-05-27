@@ -11,5 +11,6 @@ mod server;
 pub use address::Address;
 pub use connection::ConnectionManager;
 pub use hooks::UserId;
-pub use relay::copy_bidirectional_with_stats;
+#[allow(unused_imports)] // pub API for integration tests; bin uses via type inference
+pub use relay::{copy_bidirectional_with_stats, CopyResult, RelayTermination};
 pub use server::Server;

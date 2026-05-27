@@ -171,12 +171,21 @@ pub struct CliArgs {
     )]
     pub tcp_nodelay: bool,
 
-    /// After client closes (upload EOF), wait this long for remote to finish
-    #[arg(long, env = "X_PANDA_NAIVE_UPLINK_ONLY_TIMEOUT", default_value = "2s", value_parser = parse_duration, help_heading = "Performance")]
+    /// After client closes (upload EOF), wait this long for remote to finish.
+    ///
+    /// Must be long enough for the remote server to process the request and send
+    /// back a response after the client finishes uploading (e.g. HTTP POST).
+    /// speedtest.net upload typically needs 3–10s for the server to respond;
+    /// 30s provides a safe margin without keeping truly dead connections alive
+    /// (the idle_timeout handles genuinely silent connections).
+    #[arg(long, env = "X_PANDA_NAIVE_UPLINK_ONLY_TIMEOUT", default_value = "30s", value_parser = parse_duration, help_heading = "Performance")]
     pub uplink_only_timeout: Duration,
 
-    /// After remote closes (download EOF), wait this long for client to finish
-    #[arg(long, env = "X_PANDA_NAIVE_DOWNLINK_ONLY_TIMEOUT", default_value = "5s", value_parser = parse_duration, help_heading = "Performance")]
+    /// After remote closes (download EOF), wait this long for client to finish.
+    ///
+    /// Must be long enough to drain all in-flight data through the QUIC/H3
+    /// pipeline to the client on high-latency international links.
+    #[arg(long, env = "X_PANDA_NAIVE_DOWNLINK_ONLY_TIMEOUT", default_value = "30s", value_parser = parse_duration, help_heading = "Performance")]
     pub downlink_only_timeout: Duration,
 
     /// Maximum concurrent connections (use 'auto' to derive from system resources)
@@ -425,8 +434,8 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            uplink_only_timeout: Duration::from_secs(2),
-            downlink_only_timeout: Duration::from_secs(5),
+            uplink_only_timeout: Duration::from_secs(30),
+            downlink_only_timeout: Duration::from_secs(30),
             max_connections: MaxConnections::Fixed(10_000),
             block_private_ip: true,
             refresh_geodata: false,
@@ -465,8 +474,8 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            uplink_only_timeout: Duration::from_secs(2),
-            downlink_only_timeout: Duration::from_secs(5),
+            uplink_only_timeout: Duration::from_secs(30),
+            downlink_only_timeout: Duration::from_secs(30),
             max_connections: MaxConnections::Fixed(10_000),
             panel_ip_version: IpVersion::V4,
         };
@@ -625,8 +634,8 @@ mod tests {
         let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.max_connections, 10_000);
         assert_eq!(config.idle_timeout_secs(), 300);
-        assert_eq!(config.uplink_only_timeout_secs(), 2);
-        assert_eq!(config.downlink_only_timeout_secs(), 5);
+        assert_eq!(config.uplink_only_timeout_secs(), 30);
+        assert_eq!(config.downlink_only_timeout_secs(), 30);
     }
 
     #[test]
