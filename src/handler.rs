@@ -357,32 +357,32 @@ where
 {
     let relay_start = std::time::Instant::now();
     let stats = Arc::clone(&server.stats);
-    // suppress_a_to_b_shutdown = false: propagate the client half-close as a
+    // suppress_a_to_b_shutdown = true: do NOT forward a client half-close as a
     // TCP FIN to the origin server.
     //
-    // When a NaiveProxy / sing-box client closes its QUIC upload stream
-    // (END_STREAM) after forwarding a proxied HTTP request, the relay sends a
-    // TCP FIN to the origin.  HTTP/1.1 servers treat FIN correctly: it signals
-    // "client is done writing" and the server sends its full response before
-    // closing its own side.  This is standard HTTP/1.1 half-duplex shutdown and
-    // is how sing-box itself handles the same case.
+    // Why we suppress FIN propagation for H3/QUIC → TCP CONNECT tunnelling:
     //
-    //   • Download test: client sends GET + END_STREAM → FIN → ooklaserver
-    //     replies with 200 + full body + FIN → relay completes normally.
+    // Ookla speedtest servers (and many other HTTP/1.1 servers) use keep-alive
+    // and pipeline multiple latency-probe requests over a single TCP connection.
+    // A NaiveProxy / sing-box client sends END_STREAM on its QUIC upload stream
+    // after each logical HTTP request burst, but expects subsequent responses to
+    // keep arriving on the same tunnel.  If we forwarded that END_STREAM as a
+    // TCP FIN, the origin would see "client done writing" and close the
+    // keep-alive connection — breaking the very next ping and producing the
+    // speedtest "Could not connect to the test server" error.
     //
-    //   • Latency pings: client sends GET + END_STREAM → FIN → gstatic replies
-    //     with 302 + FIN → relay completes immediately (no 30-second stall).
+    // The half-close timer in relay.rs handles the safety bound:
     //
-    //   • Upload test: client streams POST body, closes upload when done → FIN
-    //     → server ACKs, relay completes normally.
+    //   • If the origin had already started sending data before the client
+    //     half-closed (latency ping case), the timer is armed at the short
+    //     UPLINK_HALF_CLOSE_IDLE window (5 s) so silent keep-alive connections
+    //     close promptly instead of stalling for 30 s.
     //
-    // Historical note: an earlier version used suppress=true based on a flawed
-    // test with `nc -q1`, which exits 1 second after stdin EOF — before the
-    // full response body arrives — making it appear that ooklaserver truncated
-    // the response.  Re-testing with curl confirmed ooklaserver returns the full
-    // body when FIN is used.  suppress=true caused a 30-second half-close stall
-    // on every latency ping (server keeps TCP alive with keep-alive after the
-    // small response), breaking the speedtest latency test.
+    //   • If the origin has not responded yet (download test before headers),
+    //     the timer is armed at uplink_only_timeout (30 s) to allow the server
+    //     time to start streaming the body.  Once data starts flowing, the timer
+    //     resets to UPLINK_HALF_CLOSE_IDLE on every chunk, keeping the relay
+    //     alive for the full transfer.
     let relay_fut = copy_bidirectional_with_stats(
         padded,
         remote_stream,
@@ -391,7 +391,7 @@ where
         server.conn_config.downlink_only_timeout_secs(),
         server.conn_config.buffer_size,
         Some((user_id, stats)),
-        false,
+        true,
     );
 
     let cancelled = tokio::select! {

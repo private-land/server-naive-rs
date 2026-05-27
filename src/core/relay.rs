@@ -242,9 +242,22 @@ where
 
         if a_to_b.has_read_eof() && !b_to_a.is_done() && !half_close_active {
             half_close_active = true;
+            // If the origin has already started responding before the client
+            // half-closed (e.g. latency ping: server sends 302, then client
+            // sends END_STREAM), arm the short idle window — the response is
+            // already on the wire, so we only need to detect the keep-alive
+            // silence.  Otherwise (download case: client closes upload before
+            // server begins streaming the body), arm uplink_only_timeout to
+            // give the origin time to start; subsequent b_progress events will
+            // reset the timer to the short window on each chunk.
+            let initial = if b_to_a.bytes_transferred() > 0 {
+                uplink_only_timeout.min(UPLINK_HALF_CLOSE_IDLE)
+            } else {
+                uplink_only_timeout
+            };
             half_close_sleep
                 .as_mut()
-                .reset(tokio::time::Instant::now() + uplink_only_timeout);
+                .reset(tokio::time::Instant::now() + initial);
         }
         if b_to_a.has_read_eof() && !a_to_b.is_done() && !half_close_active {
             half_close_active = true;
