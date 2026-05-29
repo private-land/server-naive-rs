@@ -11,6 +11,9 @@
 use crate::config;
 use crate::transport::quiche_tls::QuicheTlsPaths;
 use anyhow::Result;
+use futures_util::SinkExt as _;
+use quiche::h3::Header;
+use tokio_quiche::http3::driver::{IncomingH3Headers, OutboundFrame};
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::settings::QuicSettings;
@@ -58,6 +61,35 @@ pub fn make_h3_settings() -> Http3Settings {
         enable_extended_connect: true,
         ..Default::default()
     }
+}
+
+/// Send a minimal `200 OK` response on the CONNECT stream described by
+/// `headers`.  The full handler (auth, padding, routing, relay) gets layered
+/// on top of this in later steps.
+///
+/// A7 stub: emits status 500 so the client-side status check fails red.
+/// The empty-body+fin frame is required even on the stub: without it the
+/// frame_sender drop terminates the stream as RemoteTerminate / CANCELLED
+/// and the client never sees the headers.
+#[allow(dead_code)]
+pub async fn respond_200_to_connect(headers: IncomingH3Headers) {
+    use tokio_quiche::buf_factory::BufFactory;
+    use tokio_quiche::quiche::BufFactory as _;
+
+    let IncomingH3Headers {
+        send: mut frame_sender,
+        ..
+    } = headers;
+    let response = vec![Header::new(b":status", b"500")]; // stub: green sends 200
+    if frame_sender
+        .send(OutboundFrame::Headers(response, None))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let empty = BufFactory::buf_from_slice(&[]);
+    let _ = frame_sender.send(OutboundFrame::Body(empty, true)).await;
 }
 
 /// Build a `QuicSettings` for the tokio-quiche server, mirroring the tuning
@@ -321,6 +353,88 @@ mod tests {
             );
 
             accept_task.abort();
+        }
+
+        // ── A7: server responds 200 to a CONNECT request ────────────────────
+        //
+        // Pumps the H3 controller event stream: when we receive the first
+        // `ServerH3Event::Headers`, hand the IncomingH3Headers to
+        // `respond_200_to_connect` which sends `:status 200`.  The h3 client
+        // verifies it receives a 200.
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quiche_connect_responds_200() {
+            use tokio_quiche::http3::driver::ServerH3Event;
+
+            install_crypto();
+            let (cert_file, key_file, cert_der) = gen_cert_files();
+            let tls = QuicheTlsPaths::new(cert_file.path(), key_file.path()).unwrap();
+            let settings = make_quiche_settings(&CongestionControl::Cubic);
+
+            let server_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+            let mut listener =
+                bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
+
+            let accept_task = tokio::spawn(async move {
+                let initial = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|res| res.ok());
+                let Some(conn) = initial else { return };
+                let (driver, mut controller) =
+                    tokio_quiche::ServerH3Driver::new(make_h3_settings());
+                conn.start(driver);
+
+                // Pump events until we see Headers, then respond.
+                while let Some(event) = controller.event_receiver_mut().recv().await {
+                    if let ServerH3Event::Headers {
+                        incoming_headers, ..
+                    } = event
+                    {
+                        respond_200_to_connect(incoming_headers).await;
+                        break;
+                    }
+                }
+            });
+
+            let quic_conn = tokio::time::timeout(
+                Duration::from_secs(10),
+                quinn_connect(cert_der, server_addr),
+            )
+            .await
+            .expect("client connect should not time out")
+            .expect("client connect should succeed");
+
+            let h3_conn = h3_quinn::Connection::new(quic_conn);
+            let (mut h3_driver, mut send_req) = h3::client::new(h3_conn).await.unwrap();
+            let driver_task = tokio::spawn(std::future::poll_fn(move |cx| h3_driver.poll_close(cx)));
+
+            // Give the server time to flush SETTINGS so its CONNECT advertisement
+            // is in effect before we open the stream.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let req = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri("example.com:80")
+                .body(())
+                .unwrap();
+            let mut stream = send_req.send_request(req).await.unwrap();
+
+            let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
+                .await
+                .expect("recv_response timed out")
+                .expect("recv_response failed");
+
+            assert_eq!(
+                resp.status(),
+                http::StatusCode::OK,
+                "CONNECT must receive a 200 OK"
+            );
+
+            accept_task.abort();
+            driver_task.abort();
         }
     }
 }
