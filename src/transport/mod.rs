@@ -3,6 +3,7 @@
 mod h2;
 mod h3;
 mod padding;
+pub(crate) mod quiche_stream;
 pub(crate) mod quiche_tls;
 mod tls;
 
