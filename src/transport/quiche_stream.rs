@@ -44,17 +44,50 @@ impl H3StreamReader {
 impl AsyncRead for H3StreamReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // A8 stub — always signal EOF before reading anything.  The test
-        // expects 2 bytes ("hi") followed by EOF, so this fails on the first
-        // assertion (n == 2).  The green commit replaces this with the real
-        // chunked read.
-        let _ = &mut self.buf;
-        let _ = &mut self.fin;
-        let _ = &mut self.recv;
-        Poll::Ready(Ok(()))
+        loop {
+            // 1. Drain any leftover bytes from the previous frame first.
+            if let Some(ref mut b) = self.buf {
+                if !b.is_empty() {
+                    let len = std::cmp::min(b.len(), buf.remaining());
+                    buf.put_slice(&b[..len]);
+                    *b = b.slice(len..);
+                    if b.is_empty() {
+                        self.buf = None;
+                    }
+                    return Poll::Ready(Ok(()));
+                } else {
+                    self.buf = None;
+                }
+            }
+
+            // 2. If the peer's FIN has already arrived and the buffer is
+            //    drained, surface EOF (poll_read returns Ok with no bytes
+            //    written — tokio's AsyncRead EOF contract).
+            if self.fin {
+                return Poll::Ready(Ok(()));
+            }
+
+            // 3. Pull the next frame from the channel.  Datagrams are
+            //    ignored (NaiveProxy doesn't use H3 datagrams).  Sender drop
+            //    is treated as a clean EOF — the driver shut down.
+            match self.recv.poll_recv(cx) {
+                Poll::Ready(Some(InboundFrame::Body(data, fin))) => {
+                    if fin {
+                        self.fin = true;
+                    }
+                    if !data.is_empty() {
+                        self.buf = Some(bytes::Bytes::copy_from_slice(&data));
+                    }
+                    // Loop to either serve from buf or hit the fin EOF check.
+                }
+                Poll::Ready(Some(InboundFrame::Datagram(_))) => continue,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
