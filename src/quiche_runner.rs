@@ -11,6 +11,7 @@
 use crate::config;
 use crate::transport::quiche_tls::QuicheTlsPaths;
 use anyhow::Result;
+use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::settings::QuicSettings;
 use tokio_quiche::QuicConnectionStream;
@@ -39,6 +40,23 @@ pub fn bind_h3_listener(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("tokio_quiche::listen returned no listener"))
+}
+
+/// Build the per-connection HTTP/3 driver settings.
+///
+/// NaiveProxy uses HTTP CONNECT tunneling, which requires
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` (RFC 9220).  Cronet/sing-box clients
+/// open the first CONNECT stream before the server's SETTINGS arrive
+/// (succeeds) but refuse all subsequent CONNECT streams once SETTINGS is
+/// processed and the flag is absent — exactly the bug that broke multi-thread
+/// speed tests in the legacy quinn path (v0.1.2 fix).  We carry that lesson
+/// forward here.
+///
+/// A6 stub: returns `Http3Settings::default()`, which leaves
+/// `enable_extended_connect = false`.  The green commit flips it on.
+#[allow(dead_code)]
+pub fn make_h3_settings() -> Http3Settings {
+    Http3Settings::default()
 }
 
 /// Build a `QuicSettings` for the tokio-quiche server, mirroring the tuning
@@ -226,6 +244,81 @@ mod tests {
             assert_eq!(hd.protocol.as_deref(), Some(&b"h3"[..]), "ALPN must be h3");
 
             drop(conn);
+            accept_task.abort();
+        }
+
+        // ── A6: server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1 ──────
+        //
+        // We point a hyperium/h3 client at the quiche server and read the
+        // SETTINGS frame the driver emits.  The driver is created with our
+        // `make_h3_settings()`; the assertion catches the case where the
+        // function forgets to flip `enable_extended_connect` on.
+
+        async fn drive_h3_client(
+            driver: &mut h3::client::Connection<h3_quinn::Connection, bytes::Bytes>,
+            budget: Duration,
+        ) {
+            tokio::select! {
+                _ = tokio::time::sleep(budget) => {}
+                _ = std::future::poll_fn(|cx| driver.poll_close(cx)) => {}
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quiche_advertises_extended_connect_setting() {
+            use h3::ConnectionState as _;
+
+            install_crypto();
+            let (cert_file, key_file, cert_der) = gen_cert_files();
+            let tls = QuicheTlsPaths::new(cert_file.path(), key_file.path()).unwrap();
+            let settings = make_quiche_settings(&CongestionControl::Cubic);
+
+            let server_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+            let mut listener =
+                bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
+
+            // Server task: accept one connection, start the H3 driver with
+            // the production `make_h3_settings()`.  We don't process any
+            // events for A6 — receiving SETTINGS on the client side is what
+            // the test asserts.
+            let accept_task = tokio::spawn(async move {
+                let initial = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|res| res.ok());
+                if let Some(conn) = initial {
+                    let (driver, mut controller) =
+                        tokio_quiche::ServerH3Driver::new(make_h3_settings());
+                    conn.start(driver);
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        controller.event_receiver_mut().recv(),
+                    )
+                    .await;
+                }
+            });
+
+            let quic_conn = tokio::time::timeout(
+                Duration::from_secs(10),
+                quinn_connect(cert_der, server_addr),
+            )
+            .await
+            .expect("client connect should not time out")
+            .expect("client connect should succeed");
+
+            let h3_conn = h3_quinn::Connection::new(quic_conn);
+            let (mut h3_driver, send_req) = h3::client::new(h3_conn).await.unwrap();
+
+            // Drive briefly so the client processes the server's SETTINGS frame.
+            drive_h3_client(&mut h3_driver, Duration::from_millis(500)).await;
+
+            assert!(
+                send_req.settings().enable_extended_connect(),
+                "quiche server MUST advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1"
+            );
+
             accept_task.abort();
         }
     }
