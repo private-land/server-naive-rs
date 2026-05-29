@@ -12,12 +12,13 @@
 use crate::acl;
 use crate::core::{copy_bidirectional_with_stats, hooks, Address, Server, UserId};
 use crate::logger::log;
-use crate::transport::{generate_padding_header, H2Transport, H3Transport, NaivePaddedTransport};
+use crate::transport::pingora_session::{run_session_bridge, BRIDGE_BUF};
+use crate::transport::quiche_stream::{H3StreamReader, H3StreamWriter};
+use crate::transport::{generate_padding_header, NaivePaddedTransport};
 use crate::uot;
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
-use bytes::Bytes;
 use socket2::{SockRef, TcpKeepalive};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,130 +56,207 @@ pub fn parse_basic_auth(auth_header: &str) -> Result<String> {
     })
 }
 
-// ── H2 entry point ────────────────────────────────────────────────────────────
+// ── H2 entry point (pingora backend) ──────────────────────────────────────────
 
-/// Process a single H2 CONNECT request.
-pub async fn process_request(
+/// Send a status-only error response and close the response side.
+async fn send_pingora_status(session: &mut pingora::proxy::Session, status: u16) {
+    if let Ok(resp) = pingora::http::ResponseHeader::build(status, None) {
+        let _ = session.write_response_header(Box::new(resp), true).await;
+    }
+}
+
+/// Process a CONNECT request that arrived on the pingora backend.
+///
+/// Mirrors the legacy hyperium/h2 entry but adapts to pingora's `Session`:
+/// pseudo-headers and body framing live on `session.downstream_session`, and
+/// the body has to be pumped through a duplex bridge so the shared
+/// `process_tunnel` keeps its `T: AsyncRead + AsyncWrite + Unpin + Send +
+/// 'static` bound.
+pub async fn process_h2_request_pingora(
     server: &Server,
-    req: http::Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<Bytes>,
+    session: &mut pingora::proxy::Session,
     peer_addr: SocketAddr,
 ) -> Result<()> {
+    use pingora::http::ResponseHeader;
+
     // Validate method — only CONNECT is accepted.
-    if req.method() != http::Method::CONNECT {
-        let response = http::Response::builder()
-            .status(http::StatusCode::METHOD_NOT_ALLOWED)
-            .body(())?;
-        let _ = respond.send_response(response, true);
-        return Err(anyhow!("Expected CONNECT method, got {}", req.method()));
+    let method = session.req_header().method.clone();
+    if method != http::Method::CONNECT {
+        send_pingora_status(session, 405).await;
+        return Err(anyhow!("Expected CONNECT method, got {method}"));
     }
 
-    // Require the naive Padding header (present in all real naive clients).
-    if req.headers().get("padding").is_none() {
-        let response = http::Response::builder()
-            .status(http::StatusCode::BAD_REQUEST)
-            .body(())?;
-        let _ = respond.send_response(response, true);
-        return Err(anyhow!("Missing naive Padding header from {}", peer_addr));
+    // Require the naive Padding header.
+    if session.req_header().headers.get("padding").is_none() {
+        send_pingora_status(session, 400).await;
+        return Err(anyhow!("Missing naive Padding header from {peer_addr}"));
     }
 
-    // Parse :authority header for the tunnel target.
-    let authority = req
-        .uri()
+    // Parse target authority from the CONNECT URI.
+    let authority = session
+        .req_header()
+        .uri
         .authority()
-        .map(|a| a.as_str())
-        .ok_or_else(|| anyhow!("Missing :authority in CONNECT request"))?;
-    let target = Address::from_authority(authority)
-        .ok_or_else(|| anyhow!("Invalid target address: {}", authority))?;
+        .map(|a| a.to_string())
+        .ok_or_else(|| anyhow!("Missing authority in CONNECT request from {peer_addr}"))?;
+    let target = Address::from_authority(&authority)
+        .ok_or_else(|| anyhow!("Invalid target address: {authority}"))?;
 
     // Parse and authenticate.
-    let credential = extract_credential(req.headers(), peer_addr)?;
-    let user_id = authenticate(server, &credential, peer_addr, || {
-        if let Ok(r) = http::Response::builder()
-            .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .body(())
-        {
-            let _ = respond.send_response(r, true);
+    let auth_header_str = match session
+        .req_header()
+        .headers
+        .get("proxy-authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+    {
+        Some(v) => v,
+        None => {
+            log::authentication(peer_addr, false);
+            send_pingora_status(session, 407).await;
+            return Err(anyhow!("Missing Proxy-Authorization header"));
         }
-    })?;
+    };
+    let credential = match parse_basic_auth(&auth_header_str) {
+        Ok(c) => c,
+        Err(e) => {
+            send_pingora_status(session, 407).await;
+            return Err(e);
+        }
+    };
+    let user_id = match server.authenticator.authenticate(&credential) {
+        Some(id) => id,
+        None => {
+            log::authentication(peer_addr, false);
+            send_pingora_status(session, 407).await;
+            return Err(anyhow!("Authentication failed for peer {peer_addr}"));
+        }
+    };
+    log::authentication(peer_addr, true);
+    log::debug!(peer = %peer_addr, user_id = user_id, target = %target, "H2-pingora CONNECT authenticated");
 
     // Route the connection.
     let outbound_type = server.router.route(&target).await;
     if matches!(outbound_type, hooks::OutboundType::Reject) {
-        log::debug!(peer = %peer_addr, target = %target, "Connection rejected by router");
-        let response = http::Response::builder()
-            .status(http::StatusCode::FORBIDDEN)
-            .body(())?;
-        let _ = respond.send_response(response, true);
+        log::debug!(peer = %peer_addr, target = %target, "H2-pingora rejected by router");
+        send_pingora_status(session, 403).await;
         return Ok(());
     }
 
-    // Send 200 Connection Established with a naive Padding response header.
-    let response = http::Response::builder()
-        .status(http::StatusCode::OK)
-        .header("padding", generate_padding_header())
-        .body(())?;
-    let send_stream = respond
-        .send_response(response, false)
-        .map_err(|e| anyhow!("Failed to send 200 response: {}", e))?;
-    let recv_stream = req.into_body();
-    let padded = NaivePaddedTransport::new(H2Transport::new(recv_stream, send_stream));
+    // Send 200 with naive Padding response header.
+    let mut resp =
+        ResponseHeader::build(200, None).map_err(|e| anyhow!("build ResponseHeader: {e}"))?;
+    resp.append_header("padding", generate_padding_header())
+        .map_err(|e| anyhow!("append padding header: {e}"))?;
+    session
+        .write_response_header(Box::new(resp), false)
+        .await
+        .map_err(|e| anyhow!("write 200 response header: {e}"))?;
 
-    process_tunnel(server, padded, target, peer_addr, user_id, outbound_type).await
+    // Duplex pair: relay sees `client_io` as a normal AsyncRead+AsyncWrite,
+    // the body bridge shuttles bytes between the pingora `Session` and
+    // `server_half`.  Both futures share this async context so we never need
+    // a `'static` task for the bridge.
+    let buf = std::cmp::max(server.conn_config.buffer_size, BRIDGE_BUF);
+    let (client_io, server_half) = tokio::io::duplex(buf);
+    let padded = NaivePaddedTransport::new(client_io);
+
+    tokio::select! {
+        result = process_tunnel(server, padded, target, peer_addr, user_id, outbound_type) => {
+            result?;
+        }
+        _ = run_session_bridge(session, server_half) => {
+            // Bridge ended (session error / peer closed both sides) — that is
+            // a clean terminal state for the tunnel as well.
+        }
+    }
+
+    Ok(())
 }
 
-// ── H3 entry point ────────────────────────────────────────────────────────────
+// ── H3 entry point (tokio-quiche backend) ─────────────────────────────────────
 
-/// Process a single H3 CONNECT request.
-pub async fn process_h3_request<C>(
-    server: &Server,
-    req: http::Request<()>,
-    mut stream: h3::server::RequestStream<C, Bytes>,
+/// Process a CONNECT request that arrived on the new tokio-quiche backend.
+///
+/// Mirrors [`process_h3_request`] but adapts to tokio-quiche's
+/// `IncomingH3Headers`: pseudo-headers + raw headers come as `Vec<h3::Header>`
+/// (not `http::HeaderMap`), and the body channels are mpsc-shaped instead of
+/// the hyperium/h3 `RequestStream`.  Once the 200 response is emitted, the
+/// stream is wrapped via [`H3StreamReader`] + [`H3StreamWriter`] +
+/// [`tokio::io::join`] and handed to the shared [`process_tunnel`].
+pub async fn process_h3_request_quiche(
+    server: &crate::core::Server,
+    headers: tokio_quiche::http3::driver::IncomingH3Headers,
     peer_addr: SocketAddr,
-) -> Result<()>
-where
-    C: h3::quic::BidiStream<Bytes> + Send + 'static,
-    C::RecvStream: Send + 'static,
-    C::SendStream: Send + 'static,
-{
-    // Validate method — only CONNECT is accepted.
-    if req.method() != http::Method::CONNECT {
-        let response = http::Response::builder()
-            .status(http::StatusCode::METHOD_NOT_ALLOWED)
-            .body(())?;
-        let _ = stream.send_response(response).await;
-        let _ = stream.finish().await;
-        return Err(anyhow!("Expected CONNECT method, got {}", req.method()));
+) -> Result<()> {
+    use futures_util::SinkExt as _;
+    use quiche::h3::{Header, NameValue as _};
+    use tokio_quiche::http3::driver::OutboundFrame;
+
+    let tokio_quiche::http3::driver::IncomingH3Headers {
+        headers: header_list,
+        send: mut frame_sender,
+        recv,
+        ..
+    } = headers;
+
+    // Helper: find a header by name (case-sensitive for pseudo-headers; the
+    // h3 crate already lower-cases regular headers on the wire).
+    let find = |name: &[u8]| -> Option<&[u8]> {
+        header_list
+            .iter()
+            .find(|h| h.name() == name)
+            .map(|h| h.value())
+    };
+
+    async fn send_status(
+        frame_sender: &mut tokio_quiche::http3::driver::OutboundFrameSender,
+        status_bytes: &'static [u8],
+    ) {
+        use tokio_quiche::buf_factory::BufFactory;
+        use tokio_quiche::quiche::BufFactory as _;
+        let resp = vec![Header::new(b":status", status_bytes)];
+        let empty = BufFactory::buf_from_slice(&[]);
+        let _ = frame_sender.send(OutboundFrame::Headers(resp, None)).await;
+        let _ = frame_sender.send(OutboundFrame::Body(empty, true)).await;
     }
 
-    // Require the naive Padding header.
-    if req.headers().get("padding").is_none() {
-        let response = http::Response::builder()
-            .status(http::StatusCode::BAD_REQUEST)
-            .body(())?;
-        let _ = stream.send_response(response).await;
-        let _ = stream.finish().await;
-        return Err(anyhow!("Missing naive Padding header from {}", peer_addr));
+    // Validate method = CONNECT.
+    let method = find(b":method").unwrap_or(b"");
+    if method != b"CONNECT" {
+        send_status(&mut frame_sender, b"405").await;
+        return Err(anyhow!(
+            "Expected CONNECT method, got {}",
+            String::from_utf8_lossy(method)
+        ));
     }
 
-    // Parse :authority header for the tunnel target.
-    let authority = req
-        .uri()
-        .authority()
-        .map(|a| a.as_str())
+    // Naive marker — every real client sends a `padding` header on the request.
+    if find(b"padding").is_none() {
+        send_status(&mut frame_sender, b"400").await;
+        return Err(anyhow!("Missing naive Padding header from {peer_addr}"));
+    }
+
+    // Parse :authority into a target address.
+    let authority = find(b":authority")
+        .and_then(|v| std::str::from_utf8(v).ok())
         .ok_or_else(|| anyhow!("Missing :authority in H3 CONNECT request"))?;
-    let target = Address::from_authority(authority)
-        .ok_or_else(|| anyhow!("Invalid target address: {}", authority))?;
+    let target = crate::core::Address::from_authority(authority)
+        .ok_or_else(|| anyhow!("Invalid target address: {authority}"))?;
 
-    // Parse and authenticate.
-    let credential = match extract_credential(req.headers(), peer_addr) {
+    // Proxy-Authorization is the only place credentials live.
+    let auth_header = match find(b"proxy-authorization").and_then(|v| std::str::from_utf8(v).ok()) {
+        Some(v) => v,
+        None => {
+            log::authentication(peer_addr, false);
+            send_status(&mut frame_sender, b"407").await;
+            return Err(anyhow!("Missing Proxy-Authorization header"));
+        }
+    };
+    let credential = match parse_basic_auth(auth_header) {
         Ok(c) => c,
         Err(e) => {
-            let response = http::Response::builder()
-                .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .body(())?;
-            let _ = stream.send_response(response).await;
-            let _ = stream.finish().await;
+            send_status(&mut frame_sender, b"407").await;
             return Err(e);
         }
     };
@@ -187,42 +265,40 @@ where
         Some(id) => id,
         None => {
             log::authentication(peer_addr, false);
-            let response = http::Response::builder()
-                .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .body(())?;
-            let _ = stream.send_response(response).await;
-            let _ = stream.finish().await;
-            return Err(anyhow!("Authentication failed for peer {}", peer_addr));
+            send_status(&mut frame_sender, b"407").await;
+            return Err(anyhow!("Authentication failed for peer {peer_addr}"));
         }
     };
     log::authentication(peer_addr, true);
-    log::debug!(peer = %peer_addr, user_id = user_id, target = %target, "H3 CONNECT authenticated");
+    log::debug!(peer = %peer_addr, user_id = user_id, target = %target, "H3-quiche CONNECT authenticated");
 
-    // Route the connection.
     let outbound_type = server.router.route(&target).await;
     if matches!(outbound_type, hooks::OutboundType::Reject) {
-        log::debug!(peer = %peer_addr, target = %target, "H3 connection rejected by router");
-        let response = http::Response::builder()
-            .status(http::StatusCode::FORBIDDEN)
-            .body(())?;
-        let _ = stream.send_response(response).await;
-        let _ = stream.finish().await;
+        log::debug!(peer = %peer_addr, target = %target, "H3-quiche connection rejected");
+        send_status(&mut frame_sender, b"403").await;
         return Ok(());
     }
 
-    // Send 200 Connection Established with a naive Padding response header.
-    let response = http::Response::builder()
-        .status(http::StatusCode::OK)
-        .header("padding", generate_padding_header())
-        .body(())?;
-    stream
-        .send_response(response)
+    // Send 200 with Padding response header.  Naive expects this exact set.
+    let padding_value = generate_padding_header();
+    let response = vec![
+        Header::new(b":status", b"200"),
+        Header::new(b"padding", padding_value.as_bytes()),
+    ];
+    if let Err(e) = frame_sender
+        .send(OutboundFrame::Headers(response, None))
         .await
-        .map_err(|e| anyhow!("Failed to send H3 200 response: {}", e))?;
+    {
+        return Err(anyhow!("Failed to send H3-quiche 200 response: {e}"));
+    }
 
-    // Wrap the H3 stream as AsyncRead + AsyncWrite and apply padding protocol.
-    let transport = H3Transport::new(stream, server.conn_config.buffer_size);
-    let padded = NaivePaddedTransport::new(transport);
+    // Wrap reader + writer into a single AsyncRead+AsyncWrite duplex, then
+    // layer the naive padding.  `process_tunnel` is generic over T and
+    // handles the rest (UoT detection, direct/proxy routing, relay+stats).
+    let reader = H3StreamReader::new(recv);
+    let writer = H3StreamWriter::new(frame_sender);
+    let combined = tokio::io::join(reader, writer);
+    let padded = NaivePaddedTransport::new(combined);
 
     process_tunnel(server, padded, target, peer_addr, user_id, outbound_type).await
 }
@@ -300,42 +376,6 @@ where
             .await
         }
         hooks::OutboundType::Reject => Ok(()), // handled above
-    }
-}
-
-// ── Auth helpers ──────────────────────────────────────────────────────────────
-
-fn extract_credential(headers: &http::HeaderMap, peer_addr: SocketAddr) -> Result<String> {
-    let auth_header = match headers.get("proxy-authorization") {
-        Some(v) => v,
-        None => {
-            log::authentication(peer_addr, false);
-            return Err(anyhow!("Missing Proxy-Authorization header"));
-        }
-    };
-
-    let auth_str = auth_header
-        .to_str()
-        .map_err(|_| anyhow!("Invalid Proxy-Authorization encoding"))?;
-    parse_basic_auth(auth_str)
-}
-
-fn authenticate(
-    server: &Server,
-    credential: &str,
-    peer_addr: SocketAddr,
-    on_fail: impl FnOnce(),
-) -> Result<UserId> {
-    match server.authenticator.authenticate(credential) {
-        Some(id) => {
-            log::authentication(peer_addr, true);
-            Ok(id)
-        }
-        None => {
-            log::authentication(peer_addr, false);
-            on_fail();
-            Err(anyhow!("Authentication failed for peer {}", peer_addr))
-        }
     }
 }
 

@@ -345,6 +345,7 @@ pub fn parse_naive_config(config_enum: NodeConfigEnum) -> Result<NaiveConfig> {
 
 /// Connection performance configuration
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Some fields no longer consumed by the pingora / tokio-quiche backends but kept on the CLI surface.
 pub struct ConnConfig {
     pub idle_timeout: Duration,
     pub uplink_only_timeout: Duration,

@@ -65,6 +65,22 @@ Release binary is at `target/release/server-naive-agent`.
 
 > Panel integration uses Connect-RPC over QUIC/H3 (`panel-connect-rpc`).
 
+### macOS build prerequisites
+
+The `tokio-quiche` / `quiche` deps pull in vendored BoringSSL via `boring-sys`, which needs `cmake`:
+
+```bash
+brew install cmake
+```
+
+On systems where the active Xcode SDK is newer than the running OS (e.g. SDK 26.x on macOS 15.x), `tikv-jemalloc-sys`'s configure script may fail with `cannot run C compiled programs` because clang stamps `-mmacosx-version-min` to the SDK version. Workaround:
+
+```bash
+MACOSX_DEPLOYMENT_TARGET=15.0 cargo build --release
+```
+
+First clean BoringSSL build takes ~3–6 minutes; subsequent builds are incremental.
+
 ## Architecture
 
 ```
