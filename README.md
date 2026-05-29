@@ -1,4 +1,4 @@
-# server-naive-agent
+# server-naive
 
 Rust implementation of the [NaiveProxy](https://github.com/klzgrad/naiveproxy) server agent. Communicates with the panel via **Connect-RPC over QUIC/H3** for config, user sync, and traffic reporting.
 
@@ -15,7 +15,7 @@ Rust implementation of the [NaiveProxy](https://github.com/klzgrad/naiveproxy) s
 ## Usage
 
 ```bash
-server-naive-agent \
+server-naive \
   --node 1 \
   --server_host 127.0.0.1 \
   --port 8082 \
