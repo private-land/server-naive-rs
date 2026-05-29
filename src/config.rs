@@ -46,25 +46,21 @@ const DEFAULT_DATA_DIR: &str = "/var/lib/naive-agent-node";
 )]
 #[command(rename_all = "snake_case")]
 pub struct CliArgs {
-    /// Panel server host (e.g. 127.0.0.1)
-    #[arg(long, env = "X_PANDA_NAIVE_SERVER_HOST", default_value = "127.0.0.1")]
-    pub server_host: String,
+    /// Panel HTTP API base URL (e.g. http://127.0.0.1:8080)
+    #[arg(
+        long,
+        env = "X_PANDA_NAIVE_API",
+        default_value = "http://127.0.0.1:8080"
+    )]
+    pub api: String,
 
-    /// Panel server port
-    #[arg(long, env = "X_PANDA_NAIVE_PORT", default_value_t = 8082)]
-    pub port: u16,
+    /// Panel API token
+    #[arg(long, env = "X_PANDA_NAIVE_TOKEN", default_value = "")]
+    pub token: String,
 
     /// Node ID from the panel (required)
     #[arg(long, env = "X_PANDA_NAIVE_NODE")]
     pub node: u32,
-
-    /// TLS server name (SNI) for panel connection (defaults to server_host)
-    #[arg(long, env = "X_PANDA_NAIVE_SERVER_NAME")]
-    pub server_name: Option<String>,
-
-    /// CA certificate path for panel TLS (None = system trust store)
-    #[arg(long, env = "X_PANDA_NAIVE_CA_FILE")]
-    pub ca_file: Option<String>,
 
     /// TLS certificate file path
     #[arg(
@@ -94,9 +90,13 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_NAIVE_HEARTBEAT_INTERVAL", default_value = "180s", value_parser = parse_duration)]
     pub heartbeat_interval: Duration,
 
-    /// API request timeout
-    #[arg(long, env = "X_PANDA_NAIVE_API_TIMEOUT", default_value = "15s", value_parser = parse_duration)]
-    pub api_timeout: Duration,
+    /// API request timeout in seconds
+    #[arg(
+        long = "api_timeout",
+        env = "X_PANDA_NAIVE_API_TIMEOUT",
+        default_value_t = 15
+    )]
+    pub api_timeout: u64,
 
     /// Log mode: debug, info, warn, error
     #[arg(long, env = "X_PANDA_NAIVE_LOG_MODE", default_value = "info")]
@@ -176,23 +176,12 @@ pub struct CliArgs {
     )]
     pub tcp_nodelay: bool,
 
-    /// After client closes (upload EOF), wait this long for remote to finish.
-    ///
-    /// After the client closes its upload (TCP half-close / QUIC END_STREAM),
-    /// the relay propagates a FIN to the origin and then waits up to this long
-    /// for the origin to send its response and close.  Needed for HTTP POST
-    /// upload scenarios where the server processes the body before responding
-    /// (e.g. speedtest.net upload typically needs 3–10 s to acknowledge).
-    /// 30 s provides a safe margin; the idle_timeout handles genuinely silent
-    /// connections.
-    #[arg(long, env = "X_PANDA_NAIVE_UPLINK_ONLY_TIMEOUT", default_value = "30s", value_parser = parse_duration, help_heading = "Performance")]
+    /// After client closes (upload EOF), wait this long for remote to finish
+    #[arg(long, env = "X_PANDA_NAIVE_UPLINK_ONLY_TIMEOUT", default_value = "2s", value_parser = parse_duration, help_heading = "Performance")]
     pub uplink_only_timeout: Duration,
 
-    /// After remote closes (download EOF), wait this long for client to finish.
-    ///
-    /// Must be long enough to drain all in-flight data through the QUIC/H3
-    /// pipeline to the client on high-latency international links.
-    #[arg(long, env = "X_PANDA_NAIVE_DOWNLINK_ONLY_TIMEOUT", default_value = "30s", value_parser = parse_duration, help_heading = "Performance")]
+    /// After remote closes (download EOF), wait this long for client to finish
+    #[arg(long, env = "X_PANDA_NAIVE_DOWNLINK_ONLY_TIMEOUT", default_value = "5s", value_parser = parse_duration, help_heading = "Performance")]
     pub downlink_only_timeout: Duration,
 
     /// Maximum concurrent connections (use 'auto' to derive from system resources)
@@ -211,11 +200,8 @@ impl CliArgs {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.server_host.is_empty() {
-            return Err(anyhow!("Server host is required (--server_host)"));
-        }
-        if self.port == 0 {
-            return Err(anyhow!("Port must be a positive integer (--port)"));
+        if self.api.is_empty() {
+            return Err(anyhow!("Panel API URL is required (--api)"));
         }
         if self.node == 0 {
             return Err(anyhow!("Node ID must be a positive integer"));
@@ -261,12 +247,6 @@ impl CliArgs {
             ));
         }
 
-        if let Some(ref ca) = self.ca_file {
-            if !std::path::Path::new(ca).exists() {
-                return Err(anyhow!("CA certificate file not found: {}", ca));
-            }
-        }
-
         if let Some(ref path) = self.acl_conf_file {
             if !path.exists() {
                 return Err(anyhow!("ACL config file not found: {}", path.display()));
@@ -280,6 +260,26 @@ impl CliArgs {
         }
 
         Ok(())
+    }
+}
+
+/// Transport network mode for a naive node.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NaiveNetwork {
+    /// HTTP/2 over TLS (default).
+    #[default]
+    Tcp,
+    /// HTTP/3 over QUIC.
+    Udp,
+}
+
+impl std::fmt::Display for NaiveNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NaiveNetwork::Tcp => write!(f, "tcp"),
+            NaiveNetwork::Udp => write!(f, "udp"),
+        }
     }
 }
 
@@ -337,26 +337,6 @@ impl<'de> Deserialize<'de> for CongestionControl {
     }
 }
 
-/// Transport network mode for a naive node.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum NaiveNetwork {
-    /// HTTP/2 over TLS (default).
-    #[default]
-    Tcp,
-    /// HTTP/3 over QUIC.
-    Udp,
-}
-
-impl std::fmt::Display for NaiveNetwork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NaiveNetwork::Tcp => write!(f, "tcp"),
-            NaiveNetwork::Udp => write!(f, "udp"),
-        }
-    }
-}
-
 /// Naive node configuration deserialized from panel API JSON.
 ///
 /// The panel returns `NodeConfigEnum::Naive(json_string)`.
@@ -370,9 +350,9 @@ pub struct NaiveConfig {
     ///
     /// Wire name is `server_quic_congestion_control` — that's how
     /// `server-client-rs::NaiveConfig` (the source of this JSON,
-    /// re-serialized by panel-http) names the field.  Without
-    /// this `rename` the panel value was silently dropped and we
-    /// always fell back to BBR.
+    /// re-serialized by panel-http) names the field.  Without this
+    /// `rename` the panel value was silently dropped and we always
+    /// fell back to BBR.
     #[serde(default, rename = "server_quic_congestion_control")]
     pub congestion_control: CongestionControl,
 }
@@ -468,17 +448,15 @@ mod tests {
 
     fn create_test_cli_args() -> CliArgs {
         CliArgs {
-            server_host: "127.0.0.1".to_string(),
-            port: 8082,
+            api: "http://127.0.0.1:8080".to_string(),
+            token: "".to_string(),
             node: 1,
-            server_name: None,
-            ca_file: None,
             cert_file: "/path/to/cert.pem".to_string(),
             key_file: "/path/to/key.pem".to_string(),
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(100),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(15),
+            api_timeout: 15,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
@@ -489,8 +467,8 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            uplink_only_timeout: Duration::from_secs(30),
-            downlink_only_timeout: Duration::from_secs(30),
+            uplink_only_timeout: Duration::from_secs(2),
+            downlink_only_timeout: Duration::from_secs(5),
             max_connections: MaxConnections::Fixed(10_000),
             block_private_ip: true,
             refresh_geodata: false,
@@ -506,17 +484,15 @@ mod tests {
         std::fs::write(&key_path, "dummy key").unwrap();
 
         let cli = CliArgs {
-            server_host: "127.0.0.1".to_string(),
-            port: 8082,
+            api: "http://127.0.0.1:8080".to_string(),
+            token: "".to_string(),
             node: 1,
-            server_name: None,
-            ca_file: None,
             cert_file: cert_path.to_string_lossy().to_string(),
             key_file: key_path.to_string_lossy().to_string(),
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(100),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(15),
+            api_timeout: 15,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
@@ -529,8 +505,8 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            uplink_only_timeout: Duration::from_secs(30),
-            downlink_only_timeout: Duration::from_secs(30),
+            uplink_only_timeout: Duration::from_secs(2),
+            downlink_only_timeout: Duration::from_secs(5),
             max_connections: MaxConnections::Fixed(10_000),
             panel_ip_version: IpVersion::V4,
         };
@@ -544,16 +520,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_args_validate_empty_server_host() {
+    fn test_cli_args_validate_empty_api() {
         let mut cli = create_test_cli_args();
-        cli.server_host = "".to_string();
-        assert!(cli.validate().is_err());
-    }
-
-    #[test]
-    fn test_cli_args_validate_zero_port() {
-        let mut cli = create_test_cli_args();
-        cli.port = 0;
+        cli.api = "".to_string();
         assert!(cli.validate().is_err());
     }
 
@@ -565,53 +534,36 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_args_validate_ca_file_not_found() {
-        let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
-        cli.ca_file = Some("/nonexistent/ca.pem".to_string());
-        assert!(cli.validate().is_err());
+    fn test_parse_naive_config_success() {
+        let json = r#"{"server_port":443}"#;
+        let config_enum = NodeConfigEnum::Naive(json.to_string());
+        let config = parse_naive_config(config_enum).unwrap();
+        assert_eq!(config.server_port, 443);
+        assert_eq!(config.network, NaiveNetwork::Tcp); // defaults to tcp
     }
 
-    // ── CongestionControl ────────────────────────────────────────────────────
+    #[test]
+    fn test_parse_naive_config_with_network() {
+        let json = r#"{"server_port":443,"network":"udp"}"#;
+        let config_enum = NodeConfigEnum::Naive(json.to_string());
+        let config = parse_naive_config(config_enum).unwrap();
+        assert_eq!(config.server_port, 443);
+        assert_eq!(config.network, NaiveNetwork::Udp);
+    }
+
+    #[test]
+    fn test_parse_naive_config_wrong_variant() {
+        let config_enum = NodeConfigEnum::Trojan("{}".to_string());
+        assert!(parse_naive_config(config_enum).is_err());
+    }
+
+    // ── CongestionControl deserialization ─────────────────────────────────────
 
     #[test]
     fn test_congestion_control_default_is_bbr() {
-        let cc = CongestionControl::default();
-        assert_eq!(cc, CongestionControl::Bbr);
+        assert_eq!(CongestionControl::default(), CongestionControl::Bbr);
     }
 
-    #[test]
-    fn test_congestion_control_deserialize_bbr() {
-        let cc: CongestionControl = serde_json::from_str(r#""bbr""#).unwrap();
-        assert_eq!(cc, CongestionControl::Bbr);
-    }
-
-    #[test]
-    fn test_congestion_control_deserialize_cubic() {
-        let cc: CongestionControl = serde_json::from_str(r#""cubic""#).unwrap();
-        assert_eq!(cc, CongestionControl::Cubic);
-    }
-
-    #[test]
-    fn test_congestion_control_deserialize_new_reno() {
-        let cc: CongestionControl = serde_json::from_str(r#""new_reno""#).unwrap();
-        assert_eq!(cc, CongestionControl::NewReno);
-    }
-
-    /// Unknown values now fall back to BBR (with a warn log we can't
-    /// assert here without a tracing subscriber) instead of erroring.
-    /// This matches the "panel admin can't accidentally break a node"
-    /// design choice.
-    #[test]
-    fn test_congestion_control_unknown_value_falls_back_to_bbr() {
-        let cc: CongestionControl = serde_json::from_str(r#""vegas""#).unwrap();
-        assert_eq!(cc, CongestionControl::Bbr);
-        let cc: CongestionControl = serde_json::from_str(r#""bbr3""#).unwrap();
-        assert_eq!(cc, CongestionControl::Bbr);
-        let cc: CongestionControl = serde_json::from_str(r#""garbage""#).unwrap();
-        assert_eq!(cc, CongestionControl::Bbr);
-    }
-
-    /// Panel-facing aliases the deserializer must accept.
     #[test]
     fn test_congestion_control_accepts_aliases() {
         for wire in ["bbr", "bbr2", "bbrv2", "BBR", "BBR2"] {
@@ -628,6 +580,17 @@ mod tests {
         }
     }
 
+    /// Unknown values fall back to BBR with a warn log (we can't assert
+    /// the log without a tracing subscriber, but the fallback IS the
+    /// observable behaviour).
+    #[test]
+    fn test_congestion_control_unknown_value_falls_back_to_bbr() {
+        for wire in ["vegas", "bbr3", "garbage"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::Bbr, "wire={wire}");
+        }
+    }
+
     #[test]
     fn test_congestion_control_null_or_empty_is_bbr() {
         let cc: CongestionControl = serde_json::from_str("null").unwrap();
@@ -636,31 +599,9 @@ mod tests {
         assert_eq!(cc, CongestionControl::Bbr);
     }
 
-    // ── NaiveConfig congestion_control ───────────────────────────────────────
-
-    #[test]
-    fn test_parse_naive_config_success() {
-        let json = r#"{"server_port":443}"#;
-        let config_enum = NodeConfigEnum::Naive(json.to_string());
-        let config = parse_naive_config(config_enum).unwrap();
-        assert_eq!(config.server_port, 443);
-        assert_eq!(config.network, NaiveNetwork::Tcp);
-        assert_eq!(config.congestion_control, CongestionControl::Bbr); // defaults to bbr
-    }
-
-    #[test]
-    fn test_parse_naive_config_with_network() {
-        let json = r#"{"server_port":443,"network":"udp"}"#;
-        let config_enum = NodeConfigEnum::Naive(json.to_string());
-        let config = parse_naive_config(config_enum).unwrap();
-        assert_eq!(config.server_port, 443);
-        assert_eq!(config.network, NaiveNetwork::Udp);
-        assert_eq!(config.congestion_control, CongestionControl::Bbr); // still defaults
-    }
-
     /// The panel's wire field name is `server_quic_congestion_control`
-    /// (set by server-client-rs commit 5146b77).  This was silently
-    /// dropped before we added the matching `#[serde(rename)]`.
+    /// (set by server-client-rs commit 5146b77).  Without the matching
+    /// `#[serde(rename)]` the value was silently dropped.
     #[test]
     fn test_parse_naive_config_picks_up_panel_field_name() {
         for (wire, expected) in [
@@ -678,9 +619,6 @@ mod tests {
         }
     }
 
-    /// Unknown panel-side values do NOT break the node — they default
-    /// to BBR and emit a warn log.  The wire data is still considered
-    /// valid JSON for the rest of the config.
     #[test]
     fn test_parse_naive_config_unknown_cc_does_not_fail() {
         let json = r#"{"server_port":443,"network":"udp","server_quic_congestion_control":"bbr3"}"#;
@@ -689,10 +627,6 @@ mod tests {
         assert_eq!(config.congestion_control, CongestionControl::Bbr);
     }
 
-    /// The legacy struct-field name (`congestion_control`) must NOT be
-    /// honoured — that name was never on the wire and accepting it
-    /// would mask future panel-side regressions.  Field is absent →
-    /// default BBR.
     #[test]
     fn test_parse_naive_config_legacy_field_name_is_ignored() {
         let json = r#"{"server_port":443,"network":"udp","congestion_control":"cubic"}"#;
@@ -702,14 +636,6 @@ mod tests {
             CongestionControl::Bbr,
             "non-wire field name must be ignored"
         );
-    }
-
-    // ── ServerConfig propagation ─────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_naive_config_wrong_variant() {
-        let config_enum = NodeConfigEnum::Trojan("{}".to_string());
-        assert!(parse_naive_config(config_enum).is_err());
     }
 
     #[test]
@@ -724,18 +650,6 @@ mod tests {
         assert_eq!(config.port, 443);
         assert!(config.cert.is_some());
         assert!(config.key.is_some());
-        assert_eq!(config.congestion_control, CongestionControl::Bbr);
-    }
-
-    #[test]
-    fn test_server_config_propagates_cubic() {
-        let remote = NaiveConfig {
-            server_port: 443,
-            network: NaiveNetwork::Udp,
-            congestion_control: CongestionControl::Cubic,
-        };
-        let config = ServerConfig::from_remote(&remote, &create_test_cli_args()).unwrap();
-        assert_eq!(config.congestion_control, CongestionControl::Cubic);
     }
 
     #[test]
@@ -744,8 +658,8 @@ mod tests {
         let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.max_connections, 10_000);
         assert_eq!(config.idle_timeout_secs(), 300);
-        assert_eq!(config.uplink_only_timeout_secs(), 30);
-        assert_eq!(config.downlink_only_timeout_secs(), 30);
+        assert_eq!(config.uplink_only_timeout_secs(), 2);
+        assert_eq!(config.downlink_only_timeout_secs(), 5);
     }
 
     #[test]
