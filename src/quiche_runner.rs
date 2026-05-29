@@ -436,5 +436,151 @@ mod tests {
             accept_task.abort();
             driver_task.abort();
         }
+
+        // ── A10: full bidirectional echo through the new transport stack ───
+        //
+        // End-to-end assembly test:
+        //   client CONNECT → 200 → upload UP_SIZE bytes + finish
+        //                    → server reads via H3StreamReader
+        //                    → server writes DOWN_SIZE bytes via H3StreamWriter
+        //                    → server shuts down → client receives bytes + EOF
+        //
+        // This is the milestone the plan flags for the first cronet smoke
+        // test.  No production-side stub: it exercises code that A6/A7/A8/A9
+        // already turned green.
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quiche_single_stream_bidirectional_echo() {
+            use crate::transport::quiche_stream::{H3StreamReader, H3StreamWriter};
+            use bytes::{Buf, Bytes};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio_quiche::http3::driver::ServerH3Event;
+
+            const UP_SIZE: usize = 32 * 1024;
+            const DOWN_SIZE: usize = 48 * 1024;
+
+            install_crypto();
+            let (cert_file, key_file, cert_der) = gen_cert_files();
+            let tls = QuicheTlsPaths::new(cert_file.path(), key_file.path()).unwrap();
+            let settings = make_quiche_settings(&CongestionControl::Cubic);
+            let server_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+            let mut listener =
+                bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
+
+            let download_payload: Vec<u8> = (0..DOWN_SIZE).map(|i| (i % 256) as u8).collect();
+            let download_for_server = download_payload.clone();
+
+            let accept_task = tokio::spawn(async move {
+                let initial = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|res| res.ok());
+                let Some(conn) = initial else { return };
+                let (driver, mut controller) =
+                    tokio_quiche::ServerH3Driver::new(make_h3_settings());
+                conn.start(driver);
+
+                while let Some(event) = controller.event_receiver_mut().recv().await {
+                    if let ServerH3Event::Headers {
+                        incoming_headers, ..
+                    } = event
+                    {
+                        let IncomingH3Headers {
+                            send: mut frame_sender,
+                            recv,
+                            ..
+                        } = incoming_headers;
+
+                        // Send 200 directly on the frame sender, then hand it to
+                        // the writer adapter for the body relay.
+                        let response = vec![Header::new(b":status", b"200")];
+                        frame_sender
+                            .send(OutboundFrame::Headers(response, None))
+                            .await
+                            .unwrap();
+
+                        let mut reader = H3StreamReader::new(recv);
+                        let mut writer = H3StreamWriter::new(frame_sender);
+
+                        let mut up_buf = vec![0u8; UP_SIZE];
+                        reader.read_exact(&mut up_buf).await.unwrap();
+
+                        writer.write_all(&download_for_server).await.unwrap();
+                        writer.shutdown().await.unwrap();
+                        break;
+                    }
+                }
+            });
+
+            let quic_conn = tokio::time::timeout(
+                Duration::from_secs(10),
+                quinn_connect(cert_der, server_addr),
+            )
+            .await
+            .expect("client connect should not time out")
+            .expect("client connect should succeed");
+            let h3_conn = h3_quinn::Connection::new(quic_conn);
+            let (mut h3_driver, mut send_req) = h3::client::new(h3_conn).await.unwrap();
+            let driver_task =
+                tokio::spawn(std::future::poll_fn(move |cx| h3_driver.poll_close(cx)));
+
+            // Let SETTINGS flush so CONNECT is allowed before we send it.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let upload_payload: Vec<u8> = (0..UP_SIZE).map(|i| ((i + 0x80) % 256) as u8).collect();
+
+            let req = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri("example.com:80")
+                .body(())
+                .unwrap();
+            let mut stream = send_req.send_request(req).await.unwrap();
+
+            let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
+                .await
+                .expect("recv_response timed out")
+                .expect("recv_response failed");
+            assert_eq!(
+                resp.status(),
+                http::StatusCode::OK,
+                "CONNECT must be accepted"
+            );
+
+            stream
+                .send_data(Bytes::from(upload_payload.clone()))
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+
+            // Pull the download stream to completion.
+            let mut down_buf = Vec::with_capacity(DOWN_SIZE);
+            loop {
+                let chunk = tokio::time::timeout(Duration::from_secs(5), stream.recv_data())
+                    .await
+                    .expect("download stalled")
+                    .unwrap();
+                match chunk {
+                    Some(mut data) => {
+                        let len = data.remaining();
+                        let mut tmp = vec![0u8; len];
+                        data.copy_to_slice(&mut tmp);
+                        down_buf.extend_from_slice(&tmp);
+                    }
+                    None => break,
+                }
+            }
+
+            assert_eq!(
+                down_buf.len(),
+                DOWN_SIZE,
+                "client must receive the full download payload"
+            );
+            assert_eq!(down_buf, download_payload, "download bytes must match");
+
+            accept_task.abort();
+            driver_task.abort();
+        }
     }
 }
