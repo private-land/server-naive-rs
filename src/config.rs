@@ -306,7 +306,13 @@ pub struct NaiveConfig {
     #[serde(default)]
     pub network: NaiveNetwork,
     /// QUIC congestion control (H3 only).  Defaults to BBR.
-    #[serde(default)]
+    ///
+    /// Wire name is `server_quic_congestion_control` — that's how
+    /// `server-client-rs::NaiveConfig` (the source of this JSON,
+    /// re-serialized by panel-http) names the field.  Without this
+    /// `rename` the panel value was silently dropped and we always
+    /// fell back to BBR.
+    #[serde(default, rename = "server_quic_congestion_control")]
     pub congestion_control: CongestionControl,
 }
 
@@ -508,6 +514,34 @@ mod tests {
     fn test_parse_naive_config_wrong_variant() {
         let config_enum = NodeConfigEnum::Trojan("{}".to_string());
         assert!(parse_naive_config(config_enum).is_err());
+    }
+
+    /// The panel (via server-client-rs → panel-http) re-serializes
+    /// `server_quic_congestion_control` as the wire name.  Without the
+    /// matching `#[serde(rename)]` the value was silently dropped and
+    /// every node fell back to BBR.
+    #[test]
+    fn test_parse_naive_config_picks_up_panel_congestion_control() {
+        for (wire_value, expected) in [
+            ("bbr", CongestionControl::Bbr),
+            ("cubic", CongestionControl::Cubic),
+            ("new_reno", CongestionControl::NewReno),
+        ] {
+            let json = format!(
+                r#"{{"server_port":443,"network":"udp","server_quic_congestion_control":"{wire_value}"}}"#
+            );
+            let config_enum = NodeConfigEnum::Naive(json);
+            let config = parse_naive_config(config_enum).expect("parse ok");
+            assert_eq!(config.congestion_control, expected, "wire={wire_value}");
+        }
+    }
+
+    #[test]
+    fn test_parse_naive_config_missing_cc_defaults_to_bbr() {
+        let json = r#"{"server_port":443,"network":"udp"}"#;
+        let config_enum = NodeConfigEnum::Naive(json.to_string());
+        let config = parse_naive_config(config_enum).expect("parse ok");
+        assert_eq!(config.congestion_control, CongestionControl::Bbr);
     }
 
     #[test]
