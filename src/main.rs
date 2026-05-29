@@ -273,7 +273,12 @@ async fn main() -> Result<()> {
             if use_h3 {
                 quiche_runner::run_h3_server_quiche(server, &server_config).await
             } else {
-                pingora_runner::run_h2_server_pingora(server, &server_config).await
+                pingora_runner::run_h2_server_pingora(
+                    server,
+                    &server_config,
+                    cancel_token.clone(),
+                )
+                .await
             }
         } => result,
         _ = cancel_token.cancelled() => Ok(()),

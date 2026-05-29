@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 /// Duplex buffer: at least 64 KiB to hold one full naive-padded frame
 /// without stalling the bridge.
-pub const BRIDGE_BUF: usize = 64 * 1024;
+pub(crate) const BRIDGE_BUF: usize = 64 * 1024;
 
 /// Drive a body-relay bridge between a pingora `Session` and the
 /// `server_half` end of a duplex pair.  The relay (running concurrently in

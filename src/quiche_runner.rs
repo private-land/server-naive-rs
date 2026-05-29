@@ -1,12 +1,9 @@
-//! H3/QUIC accept loop built on tokio-quiche (PoC migration; see plan
-//! `quiet-tinkering-raven.md`).
+//! H3/QUIC accept loop built on tokio-quiche.
 //!
-//! This module sits alongside `server_runner.rs` during the PoC: the runtime
-//! `--h3_backend` CLI flag selects between the legacy quinn+h3 path
-//! ([`crate::server_runner::run_h3_server`]) and the new tokio-quiche path
-//! ([`run_h3_server_quiche`]).
-//!
-//! The current step (A3) is just the `make_quiche_settings` builder.
+//! `run_h3_server_quiche` is the entry called from `main.rs` when the node
+//! is configured for UDP/H3.  Pairs with `transport::quiche_stream` for the
+//! per-stream `AsyncRead`/`AsyncWrite` adapters and with
+//! `handler::process_h3_request_quiche` for naive-protocol CONNECT handling.
 
 use crate::config;
 use crate::core::Server;
@@ -106,8 +103,17 @@ const QUIC_INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
 /// Per-stream flow-control window (~2 MB local / 2 MB remote).
 const QUIC_INITIAL_MAX_STREAM_DATA: u64 = 2 * 1024 * 1024;
 
-/// Build a `QuicSettings` for the tokio-quiche server, mirroring the tuning
-/// `server_runner::make_transport_config` applies to the quinn `TransportConfig`.
+/// Per-connection ceiling on concurrent bidirectional streams.  sing-box
+/// uses `1 << 60`; we mirror it (well under QUIC VarInt's 2^62 ceiling).
+/// Going to `u64::MAX` overflows VarInt on the wire and aborts the
+/// handshake with "illegal value" — caught the hard way during PoC dev.
+const QUIC_MAX_BIDI_STREAMS: u64 = 1u64 << 60;
+
+/// Per-connection ceiling on unidirectional streams.  Only used by H3 for
+/// the control stream + QPACK encoder/decoder streams; 256 is generous.
+const QUIC_MAX_UNI_STREAMS: u64 = 256;
+
+/// Build a `QuicSettings` for the tokio-quiche server.
 ///
 /// Returned as a free function so unit tests can exercise every CC variant
 /// without spinning up a real QUIC endpoint.
@@ -131,14 +137,9 @@ pub fn make_quiche_settings(cc: &config::CongestionControl) -> QuicSettings {
     };
 
     // Transport tuning that matches sing-box / quinn's effective profile.
-    // PoC defaults — A11/A12/cronet smoke may tune further.
     settings.max_idle_timeout = Some(std::time::Duration::from_secs(QUIC_MAX_IDLE_TIMEOUT_SECS));
-    // sing-box uses `1 << 60` for max streams; we mirror that (well under QUIC
-    // VarInt's 2^62 ceiling).  Setting u64::MAX here triggers a transport-param
-    // VarInt overflow on the wire and the handshake aborts with
-    // "illegal value".  Lesson learned 2026-05-29.
-    settings.initial_max_streams_bidi = 1u64 << 60;
-    settings.initial_max_streams_uni = 256;
+    settings.initial_max_streams_bidi = QUIC_MAX_BIDI_STREAMS;
+    settings.initial_max_streams_uni = QUIC_MAX_UNI_STREAMS;
     settings.initial_max_data = QUIC_INITIAL_MAX_DATA;
     settings.initial_max_stream_data_bidi_local = QUIC_INITIAL_MAX_STREAM_DATA;
     settings.initial_max_stream_data_bidi_remote = QUIC_INITIAL_MAX_STREAM_DATA;
@@ -168,7 +169,12 @@ fn bind_dual_stack_udp(port: u16) -> Result<tokio::net::UdpSocket> {
 
     match try_v6() {
         Ok(s) => Ok(s),
-        Err(_) => {
+        Err(v6_err) => {
+            // Common causes: kernel built without IPv6, sysctl
+            // `net.ipv6.bindv6only=1`, or the v6 socket address already in
+            // use.  Surface the reason at warn so an operator running on a
+            // v4-only host can tell why dual-stack didn't kick in.
+            log::warn!(port = port, error = %v6_err, "IPv6 dual-stack UDP bind failed, falling back to IPv4-only");
             let addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
             let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
             raw.set_reuse_address(true)?;
