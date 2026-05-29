@@ -18,17 +18,27 @@ use tokio_quiche::QuicConnectionStream;
 /// Bind a UDP socket to a tokio-quiche HTTP/3 listener.  Returns the
 /// `QuicConnectionStream` for the bound socket; each `next().await` yields one
 /// accepted (handshake-complete) QUIC connection.
-///
-/// A5 stub: returns Err so the handshake integration test fails at
-/// listener-setup; the green commit replaces this with the real `listen` call.
 pub fn bind_h3_listener(
-    _socket: tokio::net::UdpSocket,
-    _settings: QuicSettings,
-    _tls: &QuicheTlsPaths,
+    socket: tokio::net::UdpSocket,
+    settings: QuicSettings,
+    tls: &QuicheTlsPaths,
 ) -> Result<QuicConnectionStream<DefaultMetrics>> {
-    Err(anyhow::anyhow!(
-        "bind_h3_listener: not yet implemented (A5 stub)"
-    ))
+    use tokio_quiche::settings::{CertificateKind, ConnectionParams, Hooks, TlsCertificatePaths};
+
+    let tls_paths = TlsCertificatePaths {
+        cert: tls.cert(),
+        private_key: tls.private_key(),
+        kind: CertificateKind::X509,
+    };
+    let params = ConnectionParams::new_server(settings, tls_paths, Hooks::default());
+
+    let listeners = tokio_quiche::listen([socket], params, DefaultMetrics)
+        .map_err(|e| anyhow::anyhow!("tokio_quiche::listen failed: {e}"))?;
+
+    listeners
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("tokio_quiche::listen returned no listener"))
 }
 
 /// Build a `QuicSettings` for the tokio-quiche server, mirroring the tuning
@@ -174,19 +184,38 @@ mod tests {
             let mut listener =
                 bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
 
-            // Drive the listener long enough for the QUIC handshake to land.
-            // We don't need to do anything with the accepted connection for
-            // A5 — completion of `.next()` (handshake done server-side) is
-            // sufficient.
+            // Accept the InitialQuicConnection and call `.start(driver)` so
+            // tokio-quiche actually drives the QUIC handshake.  Without the
+            // driver the server never responds to the client's CHLO; we
+            // discovered this the hard way in A5's first green attempt.
             let accept_task = tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(5), listener.next()).await;
+                let initial = tokio::time::timeout(Duration::from_secs(15), listener.next())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|res| res.ok());
+                if let Some(conn) = initial {
+                    let (driver, mut controller) = tokio_quiche::ServerH3Driver::new(
+                        tokio_quiche::http3::settings::Http3Settings::default(),
+                    );
+                    conn.start(driver);
+                    // Keep the controller alive long enough for the handshake
+                    // to flush through.  We don't read any events for A5.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        controller.event_receiver_mut().recv(),
+                    )
+                    .await;
+                }
             });
 
-            let conn =
-                tokio::time::timeout(Duration::from_secs(5), quinn_connect(cert_der, server_addr))
-                    .await
-                    .expect("client connect should not time out")
-                    .expect("client connect should succeed");
+            let conn = tokio::time::timeout(
+                Duration::from_secs(10),
+                quinn_connect(cert_der, server_addr),
+            )
+            .await
+            .expect("client connect should not time out")
+            .expect("client connect should succeed");
 
             // ALPN check: quinn surfaces the negotiated protocol via
             // handshake_data downcast to rustls::HandshakeData.
@@ -197,7 +226,7 @@ mod tests {
             assert_eq!(hd.protocol.as_deref(), Some(&b"h3"[..]), "ALPN must be h3");
 
             drop(conn);
-            let _ = accept_task.await;
+            accept_task.abort();
         }
     }
 }
