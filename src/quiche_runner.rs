@@ -882,5 +882,306 @@ mod tests {
             accept_task.abort();
             driver_task.abort();
         }
+
+        // ── A12: N parallel CONNECT streams complete without HOL blocking ───
+        //
+        // Mirrors the two `green_multi_stream_*` tests in transport::h3.  We
+        // open N CONNECT streams on the same H3 connection and verify each
+        // delivers its full payload (one test for upload, one for download).
+        // If quiche's per-stream channels share state in a way that head-of-
+        // line blocks the others, the slowest stream will starve and the test
+        // times out.
+
+        const MULTI_N: usize = 8;
+        const MULTI_CHUNK: usize = 64 * 1024;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quiche_multi_stream_upload_n8() {
+            use crate::transport::quiche_stream::H3StreamReader;
+            use bytes::Bytes;
+            use std::sync::Mutex;
+            use tokio::io::AsyncReadExt;
+            use tokio_quiche::http3::driver::ServerH3Event;
+
+            install_crypto();
+            let (cert_file, key_file, cert_der) = gen_cert_files();
+            let tls = QuicheTlsPaths::new(cert_file.path(), key_file.path()).unwrap();
+            let settings = make_quiche_settings(&CongestionControl::Cubic);
+            let server_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+            let mut listener =
+                bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
+
+            let totals: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::with_capacity(MULTI_N)));
+            let totals_srv = Arc::clone(&totals);
+
+            let accept_task = tokio::spawn(async move {
+                let initial = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|res| res.ok());
+                let Some(conn) = initial else { return };
+                let (driver, mut controller) =
+                    tokio_quiche::ServerH3Driver::new(make_h3_settings());
+                conn.start(driver);
+
+                let mut handles = Vec::with_capacity(MULTI_N);
+                while handles.len() < MULTI_N {
+                    let Some(event) = controller.event_receiver_mut().recv().await else {
+                        break;
+                    };
+                    if let ServerH3Event::Headers {
+                        incoming_headers, ..
+                    } = event
+                    {
+                        let IncomingH3Headers {
+                            send: mut frame_sender,
+                            recv,
+                            ..
+                        } = incoming_headers;
+                        let totals_srv = Arc::clone(&totals_srv);
+                        handles.push(tokio::spawn(async move {
+                            let response = vec![Header::new(b":status", b"200")];
+                            frame_sender
+                                .send(OutboundFrame::Headers(response, None))
+                                .await
+                                .unwrap();
+
+                            let mut reader = H3StreamReader::new(recv);
+                            let mut total = 0usize;
+                            let mut buf = vec![0u8; 4096];
+                            loop {
+                                let n = reader.read(&mut buf).await.unwrap();
+                                if n == 0 {
+                                    break;
+                                }
+                                total += n;
+                            }
+                            totals_srv.lock().unwrap().push(total);
+                        }));
+                    }
+                }
+                // Keep pumping events while the per-stream tasks finish so
+                // the driver doesn't suspend on a pending CONTROL frame.
+                let drain = tokio::spawn(async move {
+                    while controller.event_receiver_mut().recv().await.is_some() {}
+                });
+                for h in handles {
+                    h.await.unwrap();
+                }
+                drain.abort();
+            });
+
+            let quic_conn = tokio::time::timeout(
+                Duration::from_secs(10),
+                quinn_connect(cert_der, server_addr),
+            )
+            .await
+            .expect("client connect should not time out")
+            .expect("client connect should succeed");
+            let h3_conn = h3_quinn::Connection::new(quic_conn);
+            let (mut h3_driver, mut send_req) = h3::client::new(h3_conn).await.unwrap();
+            let driver_task =
+                tokio::spawn(std::future::poll_fn(move |cx| h3_driver.poll_close(cx)));
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Open N streams up front so they all coexist on the wire.
+            let mut streams = Vec::with_capacity(MULTI_N);
+            for _ in 0..MULTI_N {
+                let req = http::Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri("example.com:80")
+                    .body(())
+                    .unwrap();
+                streams.push(send_req.send_request(req).await.unwrap());
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let payload = Bytes::from(vec![b'U'; MULTI_CHUNK]);
+            let mut client_handles = Vec::with_capacity(MULTI_N);
+            for mut stream in streams {
+                let payload = payload.clone();
+                client_handles.push(tokio::spawn(async move {
+                    let status =
+                        tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
+                            .await
+                            .expect("recv_response timed out")
+                            .expect("recv_response failed")
+                            .status();
+                    assert_eq!(status, 200);
+                    tokio::time::timeout(Duration::from_secs(10), stream.send_data(payload))
+                        .await
+                        .expect("send_data timed out")
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), stream.finish())
+                        .await
+                        .expect("finish timed out")
+                        .unwrap();
+                }));
+            }
+            for h in client_handles {
+                h.await.unwrap();
+            }
+
+            tokio::time::timeout(Duration::from_secs(15), accept_task)
+                .await
+                .expect("server task did not finish — multi-stream HOL block?")
+                .unwrap();
+
+            let counts = totals.lock().unwrap();
+            assert_eq!(counts.len(), MULTI_N, "every stream must finish");
+            for (i, &n) in counts.iter().enumerate() {
+                assert_eq!(
+                    n, MULTI_CHUNK,
+                    "stream {i}: upload expected {MULTI_CHUNK} bytes, got {n}"
+                );
+            }
+
+            driver_task.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quiche_multi_stream_download_n8() {
+            use crate::transport::quiche_stream::H3StreamWriter;
+            use bytes::Buf as _;
+            use tokio::io::AsyncWriteExt;
+            use tokio_quiche::http3::driver::ServerH3Event;
+
+            install_crypto();
+            let (cert_file, key_file, cert_der) = gen_cert_files();
+            let tls = QuicheTlsPaths::new(cert_file.path(), key_file.path()).unwrap();
+            let settings = make_quiche_settings(&CongestionControl::Cubic);
+            let server_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+            let mut listener =
+                bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
+
+            let accept_task = tokio::spawn(async move {
+                let initial = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|res| res.ok());
+                let Some(conn) = initial else { return };
+                let (driver, mut controller) =
+                    tokio_quiche::ServerH3Driver::new(make_h3_settings());
+                conn.start(driver);
+
+                let mut handles = Vec::with_capacity(MULTI_N);
+                while handles.len() < MULTI_N {
+                    let Some(event) = controller.event_receiver_mut().recv().await else {
+                        break;
+                    };
+                    if let ServerH3Event::Headers {
+                        incoming_headers, ..
+                    } = event
+                    {
+                        let IncomingH3Headers {
+                            send: mut frame_sender,
+                            ..
+                        } = incoming_headers;
+                        handles.push(tokio::spawn(async move {
+                            let response = vec![Header::new(b":status", b"200")];
+                            frame_sender
+                                .send(OutboundFrame::Headers(response, None))
+                                .await
+                                .unwrap();
+                            let mut writer = H3StreamWriter::new(frame_sender);
+                            let payload = vec![b'D'; MULTI_CHUNK];
+                            writer.write_all(&payload).await.unwrap();
+                            writer.shutdown().await.unwrap();
+                        }));
+                    }
+                }
+                let drain = tokio::spawn(async move {
+                    while controller.event_receiver_mut().recv().await.is_some() {}
+                });
+                for h in handles {
+                    h.await.unwrap();
+                }
+                drain.abort();
+            });
+
+            let quic_conn = tokio::time::timeout(
+                Duration::from_secs(10),
+                quinn_connect(cert_der, server_addr),
+            )
+            .await
+            .expect("client connect should not time out")
+            .expect("client connect should succeed");
+            let h3_conn = h3_quinn::Connection::new(quic_conn);
+            let (mut h3_driver, mut send_req) = h3::client::new(h3_conn).await.unwrap();
+            let driver_task =
+                tokio::spawn(std::future::poll_fn(move |cx| h3_driver.poll_close(cx)));
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let mut streams = Vec::with_capacity(MULTI_N);
+            for _ in 0..MULTI_N {
+                let req = http::Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri("example.com:80")
+                    .body(())
+                    .unwrap();
+                streams.push(send_req.send_request(req).await.unwrap());
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let mut client_handles = Vec::with_capacity(MULTI_N);
+            for (idx, mut stream) in streams.into_iter().enumerate() {
+                client_handles.push(tokio::spawn(async move {
+                    let status =
+                        tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
+                            .await
+                            .expect("recv_response timed out")
+                            .expect("recv_response failed")
+                            .status();
+                    assert_eq!(status, 200);
+
+                    let mut total = 0usize;
+                    loop {
+                        let chunk =
+                            tokio::time::timeout(Duration::from_secs(10), stream.recv_data())
+                                .await
+                                .unwrap_or_else(|_| {
+                                    panic!("stream {idx}: download stalled after {total} bytes")
+                                })
+                                .unwrap();
+                        match chunk {
+                            Some(mut data) => {
+                                total += data.remaining();
+                                data.advance(data.remaining());
+                            }
+                            None => break,
+                        }
+                    }
+                    (idx, total)
+                }));
+            }
+
+            let mut totals = [0usize; MULTI_N];
+            for h in client_handles {
+                let (idx, total) = h.await.unwrap();
+                totals[idx] = total;
+            }
+
+            tokio::time::timeout(Duration::from_secs(15), accept_task)
+                .await
+                .expect("server task did not finish — multi-stream HOL block?")
+                .unwrap();
+
+            for (i, &n) in totals.iter().enumerate() {
+                assert_eq!(
+                    n, MULTI_CHUNK,
+                    "stream {i}: download expected {MULTI_CHUNK} bytes, got {n}"
+                );
+            }
+
+            driver_task.abort();
+        }
     }
 }
