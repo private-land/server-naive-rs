@@ -35,6 +35,12 @@ quinn = { version = "0.11", default-features = false, features = ["rustls", "run
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
+# New H3 backend (PoC): tokio-quiche wraps cloudflare/quiche with a tokio
+# event-loop driver. Bring in `gcongestion` so the BBR variant is available
+# (Bbr2Gcongestion, mapped from config::CongestionControl::Bbr).
+tokio-quiche = { version = "0.19", features = ["gcongestion"] }
+quiche = "0.29"
+
 # ACL Engine (remote)
 acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
 
