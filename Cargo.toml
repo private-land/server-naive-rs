@@ -79,6 +79,17 @@ h2 = "0.4"
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
 panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.17" }
 
+# Patch tokio-quiche's `datagram-socket` so it builds against
+# libc >= 0.2.169 on musl targets.  Upstream's `mmsg.rs` constructs
+# `libc::msghdr` with struct-literal syntax, but newer libc added
+# private padding fields (__pad1/__pad2), which broke compilation:
+# `cannot construct msghdr with struct literal syntax due to private
+# fields`.  This vendored copy uses `MaybeUninit::zeroed()` instead
+# (same approach as the upstream PR cloudflare/quiche#2224).
+# The patched source lives under `patches/datagram-socket/`.
+[patch.crates-io]
+datagram-socket = { path = "patches/datagram-socket" }
+
 [[bench]]
 name = "padding_phase1"
 harness = false
