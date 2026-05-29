@@ -43,4 +43,32 @@ mod tests {
             "QUIC settings must advertise ALPN h3"
         );
     }
+
+    // A4 — Map config::CongestionControl variants to the strings quiche's
+    // `CongestionControlAlgorithm::FromStr` accepts.  Validated against the
+    // quiche 0.29 docs:
+    //   Reno              -> "reno"
+    //   CUBIC             -> "cubic"
+    //   Bbr2Gcongestion   -> "bbr2_gcongestion"   (requires `gcongestion` feature)
+
+    #[test]
+    fn quiche_make_settings_bbr2_when_bbr_requested() {
+        let settings = make_quiche_settings(&CongestionControl::Bbr);
+        assert_eq!(
+            settings.cc_algorithm, "bbr2_gcongestion",
+            "CC::Bbr must map to BBRv2 from the gcongestion branch"
+        );
+    }
+
+    #[test]
+    fn quiche_make_settings_cubic_when_cubic_requested() {
+        let settings = make_quiche_settings(&CongestionControl::Cubic);
+        assert_eq!(settings.cc_algorithm, "cubic");
+    }
+
+    #[test]
+    fn quiche_make_settings_reno_when_newreno_requested() {
+        let settings = make_quiche_settings(&CongestionControl::NewReno);
+        assert_eq!(settings.cc_algorithm, "reno");
+    }
 }
