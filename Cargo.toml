@@ -10,13 +10,9 @@ anyhow = "1.0"
 bytes = "1.11"
 clap = { version = "4.6", features = ["derive", "env"] }
 humantime = "2.1"
-tokio-rustls = "0.26.4"
-rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
-rustls-pemfile = "2.2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-h2 = "0.4.13"
 http = "1.4.0"
 thiserror = "2.0"
 tracing = "0.1"
@@ -31,19 +27,20 @@ arc-swap = "1"
 libc = "0.2"
 base64 = "0.22"
 socket2 = "0.6"
-quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-
-# New H3 backend (PoC): tokio-quiche wraps cloudflare/quiche with a tokio
-# event-loop driver. Bring in `gcongestion` so the BBR variant is available
-# (Bbr2Gcongestion, mapped from config::CongestionControl::Bbr).
+# H3 backend: tokio-quiche wraps cloudflare/quiche with a tokio
+# event-loop driver. `gcongestion` enables BBRv2 (mapped from
+# config::CongestionControl::Bbr).
 tokio-quiche = { version = "0.19", features = ["gcongestion"] }
 quiche = "0.29"
 
 # H2 backend: pingora — Cloudflare's production HTTP framework.
 # `boringssl` feature shares the BoringSSL stack with tokio-quiche/quiche.
 pingora = { version = "0.8", default-features = false, features = ["proxy", "boringssl"] }
+
+# Required only to install the default crypto provider at startup so the
+# rustls used internally by panel-core/connect-rust-h3 (quinn+rustls) does
+# not panic on first use.  No direct rustls usage in our own code.
+rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
 
 # ACL Engine (remote)
 acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
@@ -64,8 +61,13 @@ tokio-test = "0.4"
 tempfile = "3.15"
 rcgen = "0.14"
 criterion = { version = "0.5", features = ["html_reports"] }
-# expose ConnectionState trait so tests can read remote SETTINGS without a full h3 client loop
+# Cross-implementation client used in quiche_runner integration tests:
+# a quinn + hyperium/h3 client drives the production tokio-quiche server.
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+# `i-implement-a-third-party-backend-and-opt-into-breaking-changes` exposes
+# the ConnectionState trait so the SETTINGS test can read negotiated flags.
 h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = "0.0.10"
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
 panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.17" }
 
