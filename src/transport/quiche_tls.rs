@@ -9,6 +9,7 @@ use std::path::Path;
 
 /// Owns PEM cert/key file paths for tokio-quiche TLS configuration.
 #[allow(dead_code)] // wired into runtime starting in A5; kept allow until then.
+#[derive(Debug)]
 pub struct QuicheTlsPaths {
     cert: String,
     private_key: String,
@@ -86,6 +87,13 @@ mod tests {
         (cert_file, key_file)
     }
 
+    fn write_garbage(content: &[u8]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
     /// A1 — Constructing `QuicheTlsPaths` over a valid self-signed PEM pair
     /// must succeed and expose the input paths as `&str`.
     #[test]
@@ -94,5 +102,47 @@ mod tests {
         let paths = QuicheTlsPaths::new(cert.path(), key.path()).expect("PEM should load");
         assert_eq!(paths.cert(), cert.path().to_str().unwrap());
         assert_eq!(paths.private_key(), key.path().to_str().unwrap());
+    }
+
+    /// A2 — Garbage content in either file must yield Err.  These are the
+    /// failure modes that protect downstream tokio-quiche from being handed a
+    /// path that won't parse at handshake time, surfacing the problem at
+    /// process start instead.
+    #[test]
+    fn quiche_tls_rejects_garbage_cert() {
+        let (_valid_cert, valid_key) = write_self_signed_pem();
+        let bad_cert = write_garbage(b"not a certificate");
+        let err =
+            QuicheTlsPaths::new(bad_cert.path(), valid_key.path()).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("BEGIN CERTIFICATE"),
+            "error should mention missing cert marker, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn quiche_tls_rejects_garbage_key() {
+        let (valid_cert, _valid_key) = write_self_signed_pem();
+        let bad_key = write_garbage(b"not a private key");
+        let err =
+            QuicheTlsPaths::new(valid_cert.path(), bad_key.path()).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("PRIVATE KEY"),
+            "error should mention missing key marker, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn quiche_tls_rejects_missing_cert_file() {
+        let (_valid_cert, valid_key) = write_self_signed_pem();
+        let missing = std::path::PathBuf::from("/nonexistent/path/cert.pem");
+        let err = QuicheTlsPaths::new(&missing, valid_key.path()).expect_err("should reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reading cert"),
+            "error should mention reading cert, got: {msg}"
+        );
     }
 }
