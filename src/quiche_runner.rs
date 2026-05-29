@@ -17,13 +17,25 @@ use tokio_quiche::settings::QuicSettings;
 /// Returned as a free function so unit tests can exercise every CC variant
 /// without spinning up a real QUIC endpoint.
 #[allow(dead_code)] // wired into runtime starting in A5; kept allow until then.
-pub fn make_quiche_settings(_cc: &config::CongestionControl) -> QuicSettings {
+pub fn make_quiche_settings(cc: &config::CongestionControl) -> QuicSettings {
+    use config::CongestionControl;
+
     // `QuicSettings` is `#[non_exhaustive]`, so we start from Default and
     // overwrite only the fields we care about.  tokio-quiche already defaults
     // `alpn` to `[b"h3"]`, but we set it explicitly to document the contract:
     // a regression that nukes the field would still fail A3 here.
     let mut settings = QuicSettings::default();
     settings.alpn = vec![b"h3".to_vec()];
+
+    // CC mapping: the strings come from quiche's
+    // `CongestionControlAlgorithm::FromStr` impl (quiche 0.29).  BBRv2 needs
+    // the `gcongestion` cargo feature — already enabled on the dep.
+    settings.cc_algorithm = match cc {
+        CongestionControl::Bbr => "bbr2_gcongestion".to_string(),
+        CongestionControl::Cubic => "cubic".to_string(),
+        CongestionControl::NewReno => "reno".to_string(),
+    };
+
     settings
 }
 
