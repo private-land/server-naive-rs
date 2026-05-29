@@ -284,16 +284,57 @@ impl CliArgs {
 }
 
 /// QUIC congestion control algorithm for a naive H3 node.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+///
+/// Underlying tokio-quiche with the `gcongestion` cargo feature supports
+/// exactly three algorithms: Reno, CUBIC, and BBR**v2** (from the
+/// gcongestion branch).  Anything the panel sends outside this set is
+/// downgraded to BBR with a warn-level log so the misconfiguration is
+/// visible instead of silently masked.
+///
+/// IMPORTANT: `Bbr` here resolves to BBR**v2** on the wire (mapped to
+/// `bbr2_gcongestion` in `make_quiche_settings`).  quinn's `BbrConfig`
+/// in the legacy code path was BBR**v1** — steady-state behaviour is
+/// similar but startup and loss response differ.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CongestionControl {
-    /// BBR — bandwidth-delay product based; best for high-latency proxy links (default).
+    /// BBR (v2 via gcongestion). Default.
     #[default]
     Bbr,
-    /// CUBIC — loss-based; Quinn's original default.
+    /// CUBIC — loss-based.
     Cubic,
     /// NewReno — classic loss-based algorithm.
     NewReno,
+}
+
+impl<'de> Deserialize<'de> for CongestionControl {
+    /// Case-insensitive parser with the alias set the panel actually
+    /// emits (`bbr` / `bbr2` / `bbrv2`, `cubic`, `reno` / `newreno` /
+    /// `new_reno`).  `null` / empty string → `Bbr` (silent).  Any other
+    /// string → `Bbr` + warn log so admin-visible misconfiguration
+    /// doesn't get silently masked.  Centralising the alias list in one
+    /// place keeps callers from each having to repeat the matching
+    /// logic.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw: Option<String> = Option::deserialize(d)?;
+        let raw = match raw {
+            Some(s) => s,
+            None => return Ok(Self::Bbr), // server-client-rs uses Option<String>; null → default
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "" => Ok(Self::Bbr), // empty string from a misconfigured panel — silent
+            "bbr" | "bbr2" | "bbrv2" => Ok(Self::Bbr),
+            "cubic" => Ok(Self::Cubic),
+            "reno" | "newreno" | "new_reno" => Ok(Self::NewReno),
+            other => {
+                tracing::warn!(
+                    value = %other,
+                    "Unrecognized server_quic_congestion_control value, falling back to BBR (= BBRv2 via gcongestion). \
+                     Supported aliases: bbr/bbr2/bbrv2, cubic, reno/newreno/new_reno."
+                );
+                Ok(Self::Bbr)
+            }
+        }
+    }
 }
 
 /// Transport network mode for a naive node.
@@ -325,8 +366,14 @@ pub struct NaiveConfig {
     /// Transport mode: "tcp" (H2+TLS, default) or "udp" (H3+QUIC).
     #[serde(default)]
     pub network: NaiveNetwork,
-    /// QUIC congestion control algorithm (H3 only). Defaults to BBR.
-    #[serde(default)]
+    /// QUIC congestion control algorithm (H3 only).
+    ///
+    /// Wire name is `server_quic_congestion_control` — that's how
+    /// `server-client-rs::NaiveConfig` (the source of this JSON,
+    /// re-serialized by panel-connect-rpc) names the field.  Without
+    /// this `rename` the panel value was silently dropped and we
+    /// always fell back to BBR.
+    #[serde(default, rename = "server_quic_congestion_control")]
     pub congestion_control: CongestionControl,
 }
 
@@ -550,13 +597,43 @@ mod tests {
         assert_eq!(cc, CongestionControl::NewReno);
     }
 
+    /// Unknown values now fall back to BBR (with a warn log we can't
+    /// assert here without a tracing subscriber) instead of erroring.
+    /// This matches the "panel admin can't accidentally break a node"
+    /// design choice.
     #[test]
-    fn test_congestion_control_unknown_value_fails() {
-        let result: Result<CongestionControl, _> = serde_json::from_str(r#""invalid""#);
-        assert!(
-            result.is_err(),
-            "unknown congestion control value must fail"
-        );
+    fn test_congestion_control_unknown_value_falls_back_to_bbr() {
+        let cc: CongestionControl = serde_json::from_str(r#""vegas""#).unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
+        let cc: CongestionControl = serde_json::from_str(r#""bbr3""#).unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
+        let cc: CongestionControl = serde_json::from_str(r#""garbage""#).unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
+    }
+
+    /// Panel-facing aliases the deserializer must accept.
+    #[test]
+    fn test_congestion_control_accepts_aliases() {
+        for wire in ["bbr", "bbr2", "bbrv2", "BBR", "BBR2"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::Bbr, "wire={wire}");
+        }
+        for wire in ["cubic", "CUBIC", "Cubic"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::Cubic, "wire={wire}");
+        }
+        for wire in ["new_reno", "newreno", "reno", "NewReno", "RENO"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::NewReno, "wire={wire}");
+        }
+    }
+
+    #[test]
+    fn test_congestion_control_null_or_empty_is_bbr() {
+        let cc: CongestionControl = serde_json::from_str("null").unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
+        let cc: CongestionControl = serde_json::from_str(r#""""#).unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
     }
 
     // ── NaiveConfig congestion_control ───────────────────────────────────────
@@ -581,25 +658,50 @@ mod tests {
         assert_eq!(config.congestion_control, CongestionControl::Bbr); // still defaults
     }
 
+    /// The panel's wire field name is `server_quic_congestion_control`
+    /// (set by server-client-rs commit 5146b77).  This was silently
+    /// dropped before we added the matching `#[serde(rename)]`.
     #[test]
-    fn test_parse_naive_config_with_congestion_control_bbr() {
-        let json = r#"{"server_port":443,"network":"udp","congestion_control":"bbr"}"#;
+    fn test_parse_naive_config_picks_up_panel_field_name() {
+        for (wire, expected) in [
+            ("bbr", CongestionControl::Bbr),
+            ("bbr2", CongestionControl::Bbr),
+            ("cubic", CongestionControl::Cubic),
+            ("reno", CongestionControl::NewReno),
+            ("new_reno", CongestionControl::NewReno),
+        ] {
+            let json = format!(
+                r#"{{"server_port":443,"network":"udp","server_quic_congestion_control":"{wire}"}}"#
+            );
+            let config = parse_naive_config(NodeConfigEnum::Naive(json)).unwrap();
+            assert_eq!(config.congestion_control, expected, "wire={wire}");
+        }
+    }
+
+    /// Unknown panel-side values do NOT break the node — they default
+    /// to BBR and emit a warn log.  The wire data is still considered
+    /// valid JSON for the rest of the config.
+    #[test]
+    fn test_parse_naive_config_unknown_cc_does_not_fail() {
+        let json = r#"{"server_port":443,"network":"udp","server_quic_congestion_control":"bbr3"}"#;
         let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
+        assert_eq!(config.server_port, 443);
         assert_eq!(config.congestion_control, CongestionControl::Bbr);
     }
 
+    /// The legacy struct-field name (`congestion_control`) must NOT be
+    /// honoured — that name was never on the wire and accepting it
+    /// would mask future panel-side regressions.  Field is absent →
+    /// default BBR.
     #[test]
-    fn test_parse_naive_config_with_congestion_control_cubic() {
+    fn test_parse_naive_config_legacy_field_name_is_ignored() {
         let json = r#"{"server_port":443,"network":"udp","congestion_control":"cubic"}"#;
         let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
-        assert_eq!(config.congestion_control, CongestionControl::Cubic);
-    }
-
-    #[test]
-    fn test_parse_naive_config_with_congestion_control_new_reno() {
-        let json = r#"{"server_port":443,"network":"udp","congestion_control":"new_reno"}"#;
-        let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
-        assert_eq!(config.congestion_control, CongestionControl::NewReno);
+        assert_eq!(
+            config.congestion_control,
+            CongestionControl::Bbr,
+            "non-wire field name must be ignored"
+        );
     }
 
     // ── ServerConfig propagation ─────────────────────────────────────────────
