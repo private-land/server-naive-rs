@@ -4,7 +4,7 @@
 //! paths. This module provides an owning struct that holds the paths as
 //! `String` and can be borrowed as `TlsCertificatePaths<'_>` when needed.
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
 /// Owns PEM cert/key file paths for tokio-quiche TLS configuration.
@@ -18,14 +18,43 @@ pub struct QuicheTlsPaths {
 impl QuicheTlsPaths {
     /// Validate cert/key paths are readable PEM files and return an owner that
     /// can later be borrowed as `tokio_quiche::settings::TlsCertificatePaths`.
-    pub fn new(_cert_path: &Path, _key_path: &Path) -> Result<Self> {
-        // Stub for A1 red: returns empty strings so the test fails on the
-        // path-equality assertion (a meaningful failure mode) rather than the
-        // error path.
-        Ok(Self {
-            cert: String::new(),
-            private_key: String::new(),
-        })
+    ///
+    /// Validation is intentionally shallow — we confirm the file is readable
+    /// and contains the expected PEM markers. Full ASN.1 / key-material
+    /// parsing is deferred to BoringSSL inside tokio-quiche at handshake time;
+    /// duplicating that check here would mean pulling in a PEM parser just to
+    /// fail one millisecond earlier.
+    pub fn new(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        let cert_content = std::fs::read_to_string(cert_path)
+            .with_context(|| format!("reading cert {}", cert_path.display()))?;
+        if !cert_content.contains("BEGIN CERTIFICATE") {
+            return Err(anyhow!(
+                "not a PEM certificate (missing BEGIN CERTIFICATE marker): {}",
+                cert_path.display()
+            ));
+        }
+
+        let key_content = std::fs::read_to_string(key_path)
+            .with_context(|| format!("reading key {}", key_path.display()))?;
+        // Accept any "-----BEGIN <kind> PRIVATE KEY-----" marker so PKCS#8,
+        // EC PRIVATE KEY, RSA PRIVATE KEY, and ED25519 variants all work.
+        if !key_content.contains("PRIVATE KEY-----") {
+            return Err(anyhow!(
+                "not a PEM private key (no PRIVATE KEY marker): {}",
+                key_path.display()
+            ));
+        }
+
+        let cert = cert_path
+            .to_str()
+            .ok_or_else(|| anyhow!("cert path is not valid UTF-8: {}", cert_path.display()))?
+            .to_owned();
+        let private_key = key_path
+            .to_str()
+            .ok_or_else(|| anyhow!("key path is not valid UTF-8: {}", key_path.display()))?
+            .to_owned();
+
+        Ok(Self { cert, private_key })
     }
 
     pub fn cert(&self) -> &str {
