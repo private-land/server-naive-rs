@@ -15,9 +15,9 @@
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use tokio_quiche::http3::driver::InboundFrame;
+use tokio_quiche::http3::driver::{InboundFrame, OutboundFrame, OutboundFrameSender};
 
 /// AsyncRead half over an H3 stream's inbound frame channel.
 ///
@@ -91,11 +91,54 @@ impl AsyncRead for H3StreamReader {
     }
 }
 
+/// AsyncWrite half over an H3 stream's outbound `OutboundFrameSender`
+/// (`PollSender<OutboundFrame>`).
+///
+/// Each `poll_write` reserves channel capacity (which is what tokio-quiche
+/// uses to translate downstream QUIC flow-control back to the caller — when
+/// the QUIC send window is exhausted, the channel doesn't drain and our
+/// reservation Pends), then enqueues `OutboundFrame::Body(buf, false)`.
+/// `poll_shutdown` enqueues `OutboundFrame::Body(empty, true)` so the peer
+/// observes a clean FIN on the response side.
+pub struct H3StreamWriter {
+    send: OutboundFrameSender,
+}
+
+impl H3StreamWriter {
+    #[allow(dead_code)] // wired into handler in A10
+    pub fn new(send: OutboundFrameSender) -> Self {
+        Self { send }
+    }
+}
+
+impl AsyncWrite for H3StreamWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // A9 stub — pretend the write succeeded but never enqueue an
+        // `OutboundFrame::Body` on `self.send`.  The test's `mpsc_rx.recv()`
+        // therefore returns nothing and the assertion fails.
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // A9 stub — same shape as poll_write.
+        Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::BytesMut;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::PollSender;
 
     /// A8 — Feeding `Body(b"hi", false)` followed by `Body(empty, true)` to
     /// the reader must yield exactly the bytes "hi" then EOF (0 bytes).
@@ -119,5 +162,41 @@ mod tests {
 
         let n = reader.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "second read must signal EOF after fin");
+    }
+
+    /// A9 — write_all + shutdown must enqueue
+    ///   Body("hi", fin=false)
+    ///   Body(empty, fin=true)
+    /// on the outbound frame channel, in order.
+    #[tokio::test]
+    async fn h3_stream_writer_emits_outbound_then_fin() {
+        let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<OutboundFrame>(8);
+        let send: OutboundFrameSender = PollSender::new(mpsc_tx);
+        let mut writer = H3StreamWriter::new(send);
+
+        writer.write_all(b"hi").await.unwrap();
+        writer.shutdown().await.unwrap();
+        // Drop the writer so the PollSender closes its mpsc channel — without
+        // this `mpsc_rx.recv()` would block forever waiting on a sender that
+        // the test still holds via `writer`.
+        drop(writer);
+
+        let body = mpsc_rx.recv().await.expect("first frame must be the body");
+        match body {
+            OutboundFrame::Body(buf, fin) => {
+                assert_eq!(&buf[..], b"hi", "first body must be the written bytes");
+                assert!(!fin, "first body must not signal fin");
+            }
+            other => panic!("first frame should be Body, got {other:?}"),
+        }
+
+        let fin_frame = mpsc_rx.recv().await.expect("second frame must be the fin");
+        match fin_frame {
+            OutboundFrame::Body(buf, fin) => {
+                assert!(buf.is_empty(), "fin frame body must be empty");
+                assert!(fin, "fin frame must signal fin=true");
+            }
+            other => panic!("second frame should be Body(_,true), got {other:?}"),
+        }
     }
 }
