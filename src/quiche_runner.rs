@@ -67,8 +67,7 @@ pub fn make_h3_settings() -> Http3Settings {
 /// `headers`.  The full handler (auth, padding, routing, relay) gets layered
 /// on top of this in later steps.
 ///
-/// A7 stub: emits status 500 so the client-side status check fails red.
-/// The empty-body+fin frame is required even on the stub: without it the
+/// The empty-body+fin frame after the headers is required: without it the
 /// frame_sender drop terminates the stream as RemoteTerminate / CANCELLED
 /// and the client never sees the headers.
 #[allow(dead_code)]
@@ -80,7 +79,7 @@ pub async fn respond_200_to_connect(headers: IncomingH3Headers) {
         send: mut frame_sender,
         ..
     } = headers;
-    let response = vec![Header::new(b":status", b"500")]; // stub: green sends 200
+    let response = vec![Header::new(b":status", b"200")];
     if frame_sender
         .send(OutboundFrame::Headers(response, None))
         .await
@@ -409,7 +408,8 @@ mod tests {
 
             let h3_conn = h3_quinn::Connection::new(quic_conn);
             let (mut h3_driver, mut send_req) = h3::client::new(h3_conn).await.unwrap();
-            let driver_task = tokio::spawn(std::future::poll_fn(move |cx| h3_driver.poll_close(cx)));
+            let driver_task =
+                tokio::spawn(std::future::poll_fn(move |cx| h3_driver.poll_close(cx)));
 
             // Give the server time to flush SETTINGS so its CONNECT advertisement
             // is in effect before we open the stream.
