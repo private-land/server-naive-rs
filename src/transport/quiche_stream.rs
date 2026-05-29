@@ -113,22 +113,55 @@ impl H3StreamWriter {
 
 impl AsyncWrite for H3StreamWriter {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // A9 stub — pretend the write succeeded but never enqueue an
-        // `OutboundFrame::Body` on `self.send`.  The test's `mpsc_rx.recv()`
-        // therefore returns nothing and the assertion fails.
+        // poll_reserve gives us proper QUIC flow-control backpressure —
+        // when tokio-quiche can't push more data downstream (send window
+        // exhausted), the channel doesn't drain and our reservation Pends.
+        let Poll::Ready(res) = self.send.poll_reserve(cx) else {
+            return Poll::Pending;
+        };
+        if res.is_err() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "H3 reserve error",
+            )));
+        }
+        let body = bytes::Bytes::copy_from_slice(buf);
+        if self
+            .send
+            .send_item(OutboundFrame::Body(body, false))
+            .is_err()
+        {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "H3 send error",
+            )));
+        }
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // `PollSender::send_item` enqueues immediately on a reserved permit;
+        // there is no separate "flush" required from this side — the actual
+        // wire flush happens inside tokio-quiche.
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // A9 stub — same shape as poll_write.
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let Poll::Ready(res) = self.send.poll_reserve(cx) else {
+            return Poll::Pending;
+        };
+        if res.is_err() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "H3 shutdown reserve error",
+            )));
+        }
+        let empty = bytes::Bytes::new();
+        let _ = self.send.send_item(OutboundFrame::Body(empty, true));
         Poll::Ready(Ok(()))
     }
 }
