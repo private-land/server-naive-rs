@@ -203,6 +203,40 @@ pub struct CliArgs {
         help_heading = "Performance"
     )]
     pub max_connections: MaxConnections,
+
+    /// H3 backend implementation (PoC migration flag).
+    ///
+    ///   `quinn`  — legacy quinn + hyperium/h3 + h3-quinn stack (default).
+    ///   `quiche` — Cloudflare tokio-quiche (BoringSSL) — the new path being
+    ///              evaluated for cronet/sing-box interop.
+    ///
+    /// Only affects nodes running in UDP/H3 mode; ignored for H2/TCP nodes.
+    #[arg(
+        long,
+        env = "X_PANDA_NAIVE_H3_BACKEND",
+        default_value = "quinn",
+        value_parser = parse_h3_backend,
+        help_heading = "Network"
+    )]
+    pub h3_backend: H3Backend,
+}
+
+/// Select the H3/QUIC backend implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H3Backend {
+    /// Legacy: quinn + hyperium/h3 + h3-quinn.
+    #[default]
+    Quinn,
+    /// New: cloudflare/quiche via tokio-quiche.
+    Quiche,
+}
+
+fn parse_h3_backend(s: &str) -> Result<H3Backend, String> {
+    match s.to_lowercase().as_str() {
+        "quinn" => Ok(H3Backend::Quinn),
+        "quiche" => Ok(H3Backend::Quiche),
+        _ => Err(format!("Invalid H3 backend '{s}'. Use 'quinn' or 'quiche'")),
+    }
 }
 
 impl CliArgs {
@@ -447,6 +481,7 @@ mod tests {
             block_private_ip: true,
             refresh_geodata: false,
             panel_ip_version: IpVersion::V4,
+            h3_backend: H3Backend::Quinn,
         }
     }
 
@@ -485,6 +520,7 @@ mod tests {
             downlink_only_timeout: Duration::from_secs(30),
             max_connections: MaxConnections::Fixed(10_000),
             panel_ip_version: IpVersion::V4,
+            h3_backend: H3Backend::Quinn,
         };
         (cli, temp_dir)
     }

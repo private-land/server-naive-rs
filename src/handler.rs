@@ -12,6 +12,7 @@
 use crate::acl;
 use crate::core::{copy_bidirectional_with_stats, hooks, Address, Server, UserId};
 use crate::logger::log;
+use crate::transport::quiche_stream::{H3StreamReader, H3StreamWriter};
 use crate::transport::{generate_padding_header, H2Transport, H3Transport, NaivePaddedTransport};
 use crate::uot;
 
@@ -223,6 +224,135 @@ where
     // Wrap the H3 stream as AsyncRead + AsyncWrite and apply padding protocol.
     let transport = H3Transport::new(stream, server.conn_config.buffer_size);
     let padded = NaivePaddedTransport::new(transport);
+
+    process_tunnel(server, padded, target, peer_addr, user_id, outbound_type).await
+}
+
+// ── H3 entry point (tokio-quiche backend) ─────────────────────────────────────
+
+/// Process a CONNECT request that arrived on the new tokio-quiche backend.
+///
+/// Mirrors [`process_h3_request`] but adapts to tokio-quiche's
+/// `IncomingH3Headers`: pseudo-headers + raw headers come as `Vec<h3::Header>`
+/// (not `http::HeaderMap`), and the body channels are mpsc-shaped instead of
+/// the hyperium/h3 `RequestStream`.  Once the 200 response is emitted, the
+/// stream is wrapped via [`H3StreamReader`] + [`H3StreamWriter`] +
+/// [`tokio::io::join`] and handed to the shared [`process_tunnel`].
+pub async fn process_h3_request_quiche(
+    server: &crate::core::Server,
+    headers: tokio_quiche::http3::driver::IncomingH3Headers,
+    peer_addr: SocketAddr,
+) -> Result<()> {
+    use futures_util::SinkExt as _;
+    use quiche::h3::{Header, NameValue as _};
+    use tokio_quiche::http3::driver::OutboundFrame;
+
+    let tokio_quiche::http3::driver::IncomingH3Headers {
+        headers: header_list,
+        send: mut frame_sender,
+        recv,
+        ..
+    } = headers;
+
+    // Helper: find a header by name (case-sensitive for pseudo-headers; the
+    // h3 crate already lower-cases regular headers on the wire).
+    let find = |name: &[u8]| -> Option<&[u8]> {
+        header_list
+            .iter()
+            .find(|h| h.name() == name)
+            .map(|h| h.value())
+    };
+
+    async fn send_status(
+        frame_sender: &mut tokio_quiche::http3::driver::OutboundFrameSender,
+        status_bytes: &'static [u8],
+    ) {
+        use tokio_quiche::buf_factory::BufFactory;
+        use tokio_quiche::quiche::BufFactory as _;
+        let resp = vec![Header::new(b":status", status_bytes)];
+        let empty = BufFactory::buf_from_slice(&[]);
+        let _ = frame_sender.send(OutboundFrame::Headers(resp, None)).await;
+        let _ = frame_sender.send(OutboundFrame::Body(empty, true)).await;
+    }
+
+    // Validate method = CONNECT.
+    let method = find(b":method").unwrap_or(b"");
+    if method != b"CONNECT" {
+        send_status(&mut frame_sender, b"405").await;
+        return Err(anyhow!(
+            "Expected CONNECT method, got {}",
+            String::from_utf8_lossy(method)
+        ));
+    }
+
+    // Naive marker — every real client sends a `padding` header on the request.
+    if find(b"padding").is_none() {
+        send_status(&mut frame_sender, b"400").await;
+        return Err(anyhow!("Missing naive Padding header from {peer_addr}"));
+    }
+
+    // Parse :authority into a target address.
+    let authority = find(b":authority")
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .ok_or_else(|| anyhow!("Missing :authority in H3 CONNECT request"))?;
+    let target = crate::core::Address::from_authority(authority)
+        .ok_or_else(|| anyhow!("Invalid target address: {authority}"))?;
+
+    // Proxy-Authorization is the only place credentials live.
+    let auth_header = match find(b"proxy-authorization").and_then(|v| std::str::from_utf8(v).ok()) {
+        Some(v) => v,
+        None => {
+            log::authentication(peer_addr, false);
+            send_status(&mut frame_sender, b"407").await;
+            return Err(anyhow!("Missing Proxy-Authorization header"));
+        }
+    };
+    let credential = match parse_basic_auth(auth_header) {
+        Ok(c) => c,
+        Err(e) => {
+            send_status(&mut frame_sender, b"407").await;
+            return Err(e);
+        }
+    };
+
+    let user_id = match server.authenticator.authenticate(&credential) {
+        Some(id) => id,
+        None => {
+            log::authentication(peer_addr, false);
+            send_status(&mut frame_sender, b"407").await;
+            return Err(anyhow!("Authentication failed for peer {peer_addr}"));
+        }
+    };
+    log::authentication(peer_addr, true);
+    log::debug!(peer = %peer_addr, user_id = user_id, target = %target, "H3-quiche CONNECT authenticated");
+
+    let outbound_type = server.router.route(&target).await;
+    if matches!(outbound_type, hooks::OutboundType::Reject) {
+        log::debug!(peer = %peer_addr, target = %target, "H3-quiche connection rejected");
+        send_status(&mut frame_sender, b"403").await;
+        return Ok(());
+    }
+
+    // Send 200 with Padding response header.  Naive expects this exact set.
+    let padding_value = generate_padding_header();
+    let response = vec![
+        Header::new(b":status", b"200"),
+        Header::new(b"padding", padding_value.as_bytes()),
+    ];
+    if let Err(e) = frame_sender
+        .send(OutboundFrame::Headers(response, None))
+        .await
+    {
+        return Err(anyhow!("Failed to send H3-quiche 200 response: {e}"));
+    }
+
+    // Wrap reader + writer into a single AsyncRead+AsyncWrite duplex, then
+    // layer the naive padding.  `process_tunnel` is generic over T and
+    // handles the rest (UoT detection, direct/proxy routing, relay+stats).
+    let reader = H3StreamReader::new(recv);
+    let writer = H3StreamWriter::new(frame_sender);
+    let combined = tokio::io::join(reader, writer);
+    let padded = NaivePaddedTransport::new(combined);
 
     process_tunnel(server, padded, target, peer_addr, user_id, outbound_type).await
 }

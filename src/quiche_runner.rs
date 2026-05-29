@@ -9,11 +9,15 @@
 //! The current step (A3) is just the `make_quiche_settings` builder.
 
 use crate::config;
+use crate::core::Server;
+use crate::handler::process_h3_request_quiche;
+use crate::logger::log;
 use crate::transport::quiche_tls::QuicheTlsPaths;
 use anyhow::Result;
-use futures_util::SinkExt as _;
+use futures_util::{SinkExt as _, StreamExt};
 use quiche::h3::Header;
-use tokio_quiche::http3::driver::{IncomingH3Headers, OutboundFrame};
+use std::sync::Arc;
+use tokio_quiche::http3::driver::{IncomingH3Headers, OutboundFrame, ServerH3Event};
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::settings::QuicSettings;
@@ -91,12 +95,22 @@ pub async fn respond_200_to_connect(headers: IncomingH3Headers) {
     let _ = frame_sender.send(OutboundFrame::Body(empty, true)).await;
 }
 
+/// QUIC connection idle timeout — generous to survive cronet's
+/// keep-alive cadence on long-lived tunnels.
+const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 120;
+
+/// Per-connection flow-control window (~16 MB) — speedtest single-stream
+/// uses one CONNECT and benefits from a large window.
+const QUIC_INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
+
+/// Per-stream flow-control window (~2 MB local / 2 MB remote).
+const QUIC_INITIAL_MAX_STREAM_DATA: u64 = 2 * 1024 * 1024;
+
 /// Build a `QuicSettings` for the tokio-quiche server, mirroring the tuning
 /// `server_runner::make_transport_config` applies to the quinn `TransportConfig`.
 ///
 /// Returned as a free function so unit tests can exercise every CC variant
 /// without spinning up a real QUIC endpoint.
-#[allow(dead_code)] // wired into runtime starting in A5; kept allow until then.
 pub fn make_quiche_settings(cc: &config::CongestionControl) -> QuicSettings {
     use config::CongestionControl;
 
@@ -116,7 +130,166 @@ pub fn make_quiche_settings(cc: &config::CongestionControl) -> QuicSettings {
         CongestionControl::NewReno => "reno".to_string(),
     };
 
+    // Transport tuning that matches sing-box / quinn's effective profile.
+    // PoC defaults — A11/A12/cronet smoke may tune further.
+    settings.max_idle_timeout = Some(std::time::Duration::from_secs(QUIC_MAX_IDLE_TIMEOUT_SECS));
+    // sing-box uses `1 << 60` for max streams; we mirror that (well under QUIC
+    // VarInt's 2^62 ceiling).  Setting u64::MAX here triggers a transport-param
+    // VarInt overflow on the wire and the handshake aborts with
+    // "illegal value".  Lesson learned 2026-05-29.
+    settings.initial_max_streams_bidi = 1u64 << 60;
+    settings.initial_max_streams_uni = 256;
+    settings.initial_max_data = QUIC_INITIAL_MAX_DATA;
+    settings.initial_max_stream_data_bidi_local = QUIC_INITIAL_MAX_STREAM_DATA;
+    settings.initial_max_stream_data_bidi_remote = QUIC_INITIAL_MAX_STREAM_DATA;
+    settings.initial_max_stream_data_uni = QUIC_INITIAL_MAX_STREAM_DATA;
+    settings.enable_dgram = false;
+    settings.disable_active_migration = true;
+
     settings
+}
+
+/// Bind a dual-stack IPv6 UDP socket (also accepts IPv4 traffic) on the given
+/// port, falling back to an IPv4-only socket if the dual-stack bind fails.
+fn bind_dual_stack_udp(port: u16) -> Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let addr_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    let try_v6 = || -> Result<tokio::net::UdpSocket> {
+        let raw = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        raw.set_only_v6(false)?;
+        raw.set_reuse_address(true)?;
+        raw.bind(&SockAddr::from(addr_v6))?;
+        raw.set_nonblocking(true)?;
+        let std_sock: std::net::UdpSocket = raw.into();
+        Ok(tokio::net::UdpSocket::from_std(std_sock)?)
+    };
+
+    match try_v6() {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+            let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            raw.set_reuse_address(true)?;
+            raw.bind(&SockAddr::from(addr_v4))?;
+            raw.set_nonblocking(true)?;
+            let std_sock: std::net::UdpSocket = raw.into();
+            Ok(tokio::net::UdpSocket::from_std(std_sock)?)
+        }
+    }
+}
+
+/// Run the Naive H3 server backed by tokio-quiche.
+///
+/// Mirrors [`crate::server_runner::run_h3_server`] but routes through the new
+/// transport (`quiche_runner` + `transport/quiche_stream`).
+pub async fn run_h3_server_quiche(
+    server: Arc<Server>,
+    config: &config::ServerConfig,
+) -> Result<()> {
+    use tokio::sync::Semaphore;
+
+    let cert = config
+        .cert
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cert required for H3 backend"))?;
+    let key = config
+        .key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("key required for H3 backend"))?;
+    let tls = QuicheTlsPaths::new(cert, key)?;
+    let settings = make_quiche_settings(&config.congestion_control);
+
+    let socket = bind_dual_stack_udp(config.port)?;
+    let local_addr = socket.local_addr()?;
+    let mut listener = bind_h3_listener(socket, settings, &tls)?;
+
+    let conn_limiter = if server.conn_config.max_connections > 0 {
+        Some(Arc::new(Semaphore::new(server.conn_config.max_connections)))
+    } else {
+        None
+    };
+
+    log::info!(
+        address = %local_addr,
+        tls = true,
+        transport = "h3",
+        backend = "quiche",
+        max_connections = server.conn_config.max_connections,
+        "Naive H3 server started (tokio-quiche)"
+    );
+
+    while let Some(conn_res) = listener.next().await {
+        let initial = match conn_res {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!(error = %e, "QUIC accept error");
+                continue;
+            }
+        };
+
+        // Acquire connection permit (backpressure at limit).
+        let permit = if let Some(ref limiter) = conn_limiter {
+            match limiter.clone().acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => break, // semaphore closed → shutting down
+            }
+        } else {
+            None
+        };
+
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            let _permit = permit;
+
+            let (driver, mut controller) = tokio_quiche::ServerH3Driver::new(make_h3_settings());
+            let quic_conn = initial.start(driver);
+            let peer_addr = quic_conn.peer_addr();
+
+            log::connection(peer_addr, "new (quic-quiche)");
+            log::debug!(peer = %peer_addr, "H3-quiche connection established");
+
+            while let Some(event) = controller.event_receiver_mut().recv().await {
+                match event {
+                    ServerH3Event::Headers {
+                        incoming_headers, ..
+                    } => {
+                        let server = Arc::clone(&server);
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                process_h3_request_quiche(&server, incoming_headers, peer_addr)
+                                    .await
+                            {
+                                log::debug!(peer = %peer_addr, error = %e, "H3-quiche request error");
+                            }
+                        });
+                    }
+                    ServerH3Event::Core(core_event) => {
+                        // Connection-level signals: errors / shutdown break us out.
+                        use tokio_quiche::http3::driver::H3Event;
+                        match core_event {
+                            H3Event::ConnectionError(err) => {
+                                log::debug!(peer = %peer_addr, error = ?err, "H3-quiche conn error");
+                                break;
+                            }
+                            H3Event::ConnectionShutdown(err) => {
+                                log::debug!(peer = %peer_addr, error = ?err, "H3-quiche conn shutdown");
+                                break;
+                            }
+                            _ => {} // SETTINGS / BodyBytesReceived / StreamClosed / ResetStream — ignore
+                        }
+                    }
+                }
+            }
+
+            log::debug!(peer = %peer_addr, "H3-quiche connection closed");
+            // Hold the quic_conn until the event loop ends to keep the driver alive.
+            drop(quic_conn);
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

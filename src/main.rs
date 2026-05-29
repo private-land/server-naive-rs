@@ -16,6 +16,7 @@ mod error;
 mod handler;
 mod logger;
 mod net;
+mod quiche_runner;
 mod server_runner;
 mod transport;
 mod uot;
@@ -222,7 +223,16 @@ async fn main() -> Result<()> {
     let server_result = tokio::select! {
         result = async {
             if use_h3 {
-                server_runner::run_h3_server(server, &server_config).await
+                match cli.h3_backend {
+                    config::H3Backend::Quinn => {
+                        log::info!(backend = "quinn", "H3 backend selected");
+                        server_runner::run_h3_server(server, &server_config).await
+                    }
+                    config::H3Backend::Quiche => {
+                        log::info!(backend = "quiche", "H3 backend selected");
+                        quiche_runner::run_h3_server_quiche(server, &server_config).await
+                    }
+                }
             } else {
                 server_runner::run_server(server, &server_config).await
             }
