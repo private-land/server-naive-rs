@@ -1,4 +1,7 @@
 /target
+# Nested target/ inside vendored patches (cargo build artifacts leak here
+# when patches/<pkg> is built directly).
+patches/**/target
 
 # Dev TLS certificates
 .cert/
