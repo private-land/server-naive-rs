@@ -52,11 +52,12 @@ pub fn bind_h3_listener(
 /// speed tests in the legacy quinn path (v0.1.2 fix).  We carry that lesson
 /// forward here.
 ///
-/// A6 stub: returns `Http3Settings::default()`, which leaves
-/// `enable_extended_connect = false`.  The green commit flips it on.
 #[allow(dead_code)]
 pub fn make_h3_settings() -> Http3Settings {
-    Http3Settings::default()
+    Http3Settings {
+        enable_extended_connect: true,
+        ..Default::default()
+    }
 }
 
 /// Build a `QuicSettings` for the tokio-quiche server, mirroring the tuning
