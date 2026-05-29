@@ -15,13 +15,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  BINARY_NAME: server-naive
+  BINARY_NAME: server-naive-agent
 
 jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      # Let every target finish independently — diagnosing one failure is
+      # easier when the other artifacts have actually built.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -47,7 +50,11 @@ jobs:
         run: |
           if [[ "${{ matrix.target }}" == aarch64-* ]]; then
             sudo apt-get update
-            sudo apt-get install -y gcc-aarch64-linux-gnu
+            # g++ + binutils are required so boring-sys's cc-crate build
+            # script picks an aarch64-targeting C/C++ toolchain instead of
+            # the host's x86_64 cc (the original failure: BoringSSL .o files
+            # were ELF EM:62 = x86_64 and the linker rejected them).
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
           fi
 
       - name: Install zig (MUSL)
@@ -67,7 +74,13 @@ jobs:
       - name: Build (GNU)
         if: contains(matrix.target, '-gnu')
         env:
+          # Rust linker (final binary).
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # cc-crate build scripts (boring-sys, libz-ng-sys, zstd-sys, ...).
+          # Underscore form because env-var names can't contain dashes.
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (MUSL)

@@ -283,6 +283,60 @@ impl std::fmt::Display for NaiveNetwork {
     }
 }
 
+/// QUIC congestion control algorithm for a naive H3 node.
+///
+/// Underlying tokio-quiche with the `gcongestion` cargo feature supports
+/// exactly three algorithms: Reno, CUBIC, and BBR**v2** (from the
+/// gcongestion branch).  Anything the panel sends outside this set is
+/// downgraded to BBR with a warn-level log so the misconfiguration is
+/// visible instead of silently masked.
+///
+/// IMPORTANT: `Bbr` here resolves to BBR**v2** on the wire (mapped to
+/// `bbr2_gcongestion` in `make_quiche_settings`).  quinn's `BbrConfig`
+/// in the legacy code path was BBR**v1** — steady-state behaviour is
+/// similar but startup and loss response differ.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CongestionControl {
+    /// BBR (v2 via gcongestion). Default.
+    #[default]
+    Bbr,
+    /// CUBIC — loss-based.
+    Cubic,
+    /// NewReno — classic loss-based algorithm.
+    NewReno,
+}
+
+impl<'de> Deserialize<'de> for CongestionControl {
+    /// Case-insensitive parser with the alias set the panel actually
+    /// emits (`bbr` / `bbr2` / `bbrv2`, `cubic`, `reno` / `newreno` /
+    /// `new_reno`).  `null` / empty string → `Bbr` (silent).  Any other
+    /// string → `Bbr` + warn log so admin-visible misconfiguration
+    /// doesn't get silently masked.  Centralising the alias list in one
+    /// place keeps callers from each having to repeat the matching
+    /// logic.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw: Option<String> = Option::deserialize(d)?;
+        let raw = match raw {
+            Some(s) => s,
+            None => return Ok(Self::Bbr), // server-client-rs uses Option<String>; null → default
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "" => Ok(Self::Bbr), // empty string from a misconfigured panel — silent
+            "bbr" | "bbr2" | "bbrv2" => Ok(Self::Bbr),
+            "cubic" => Ok(Self::Cubic),
+            "reno" | "newreno" | "new_reno" => Ok(Self::NewReno),
+            other => {
+                tracing::warn!(
+                    value = %other,
+                    "Unrecognized server_quic_congestion_control value, falling back to BBR (= BBRv2 via gcongestion). \
+                     Supported aliases: bbr/bbr2/bbrv2, cubic, reno/newreno/new_reno."
+                );
+                Ok(Self::Bbr)
+            }
+        }
+    }
+}
+
 /// Naive node configuration deserialized from panel API JSON.
 ///
 /// The panel returns `NodeConfigEnum::Naive(json_string)`.
@@ -292,6 +346,15 @@ pub struct NaiveConfig {
     /// Transport mode: "tcp" (H2+TLS, default) or "udp" (H3+QUIC).
     #[serde(default)]
     pub network: NaiveNetwork,
+    /// QUIC congestion control algorithm (H3 only).
+    ///
+    /// Wire name is `server_quic_congestion_control` — that's how
+    /// `server-client-rs::NaiveConfig` (the source of this JSON,
+    /// re-serialized by panel-http) names the field.  Without this
+    /// `rename` the panel value was silently dropped and we always
+    /// fell back to BBR.
+    #[serde(default, rename = "server_quic_congestion_control")]
+    pub congestion_control: CongestionControl,
 }
 
 /// Parse a `NodeConfigEnum` into a `NaiveConfig`.
@@ -309,6 +372,7 @@ pub fn parse_naive_config(config_enum: NodeConfigEnum) -> Result<NaiveConfig> {
 
 /// Connection performance configuration
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Some fields no longer consumed by the pingora / tokio-quiche backends but kept on the CLI surface.
 pub struct ConnConfig {
     pub idle_timeout: Duration,
     pub uplink_only_timeout: Duration,
@@ -360,6 +424,8 @@ pub struct ServerConfig {
     pub acl_conf_file: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub block_private_ip: bool,
+    /// QUIC congestion control algorithm (H3 only).
+    pub congestion_control: CongestionControl,
 }
 
 impl ServerConfig {
@@ -371,6 +437,7 @@ impl ServerConfig {
             acl_conf_file: cli.acl_conf_file.clone(),
             data_dir: cli.data_dir.clone(),
             block_private_ip: cli.block_private_ip,
+            congestion_control: remote.congestion_control.clone(),
         })
     }
 }
@@ -490,11 +557,93 @@ mod tests {
         assert!(parse_naive_config(config_enum).is_err());
     }
 
+    // ── CongestionControl deserialization ─────────────────────────────────────
+
+    #[test]
+    fn test_congestion_control_default_is_bbr() {
+        assert_eq!(CongestionControl::default(), CongestionControl::Bbr);
+    }
+
+    #[test]
+    fn test_congestion_control_accepts_aliases() {
+        for wire in ["bbr", "bbr2", "bbrv2", "BBR", "BBR2"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::Bbr, "wire={wire}");
+        }
+        for wire in ["cubic", "CUBIC", "Cubic"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::Cubic, "wire={wire}");
+        }
+        for wire in ["new_reno", "newreno", "reno", "NewReno", "RENO"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::NewReno, "wire={wire}");
+        }
+    }
+
+    /// Unknown values fall back to BBR with a warn log (we can't assert
+    /// the log without a tracing subscriber, but the fallback IS the
+    /// observable behaviour).
+    #[test]
+    fn test_congestion_control_unknown_value_falls_back_to_bbr() {
+        for wire in ["vegas", "bbr3", "garbage"] {
+            let cc: CongestionControl = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(cc, CongestionControl::Bbr, "wire={wire}");
+        }
+    }
+
+    #[test]
+    fn test_congestion_control_null_or_empty_is_bbr() {
+        let cc: CongestionControl = serde_json::from_str("null").unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
+        let cc: CongestionControl = serde_json::from_str(r#""""#).unwrap();
+        assert_eq!(cc, CongestionControl::Bbr);
+    }
+
+    /// The panel's wire field name is `server_quic_congestion_control`
+    /// (set by server-client-rs commit 5146b77).  Without the matching
+    /// `#[serde(rename)]` the value was silently dropped.
+    #[test]
+    fn test_parse_naive_config_picks_up_panel_field_name() {
+        for (wire, expected) in [
+            ("bbr", CongestionControl::Bbr),
+            ("bbr2", CongestionControl::Bbr),
+            ("cubic", CongestionControl::Cubic),
+            ("reno", CongestionControl::NewReno),
+            ("new_reno", CongestionControl::NewReno),
+        ] {
+            let json = format!(
+                r#"{{"server_port":443,"network":"udp","server_quic_congestion_control":"{wire}"}}"#
+            );
+            let config = parse_naive_config(NodeConfigEnum::Naive(json)).unwrap();
+            assert_eq!(config.congestion_control, expected, "wire={wire}");
+        }
+    }
+
+    #[test]
+    fn test_parse_naive_config_unknown_cc_does_not_fail() {
+        let json = r#"{"server_port":443,"network":"udp","server_quic_congestion_control":"bbr3"}"#;
+        let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
+        assert_eq!(config.server_port, 443);
+        assert_eq!(config.congestion_control, CongestionControl::Bbr);
+    }
+
+    #[test]
+    fn test_parse_naive_config_legacy_field_name_is_ignored() {
+        let json = r#"{"server_port":443,"network":"udp","congestion_control":"cubic"}"#;
+        let config = parse_naive_config(NodeConfigEnum::Naive(json.to_string())).unwrap();
+        assert_eq!(
+            config.congestion_control,
+            CongestionControl::Bbr,
+            "non-wire field name must be ignored"
+        );
+    }
+
     #[test]
     fn test_server_config_from_remote() {
         let remote = NaiveConfig {
             server_port: 443,
             network: NaiveNetwork::Tcp,
+            congestion_control: CongestionControl::Bbr,
         };
         let cli = create_test_cli_args();
         let config = ServerConfig::from_remote(&remote, &cli).unwrap();

@@ -1,4 +1,7 @@
 /target
+# Nested target/ inside vendored patches (cargo build artifacts leak here
+# when patches/<pkg> is built directly).
+patches/**/target
 
 # Dev TLS certificates
 .cert/
@@ -13,3 +16,8 @@ CLAUDE.md
 # Docs
 docs/superpowers/
 docs/specs/
+
+# Local test configs / scripts / keys (never commit)
+singbox-test*.json
+web-key.txt
+scripts/
