@@ -18,11 +18,12 @@ use tokio_quiche::settings::QuicSettings;
 /// without spinning up a real QUIC endpoint.
 #[allow(dead_code)] // wired into runtime starting in A5; kept allow until then.
 pub fn make_quiche_settings(_cc: &config::CongestionControl) -> QuicSettings {
-    // Stub for A3 red: blank ALPN so the alpn-equality test fails.
-    // The green commit replaces this with the real builder.
-    // (`QuicSettings` is `#[non_exhaustive]`, so we mutate after Default.)
+    // `QuicSettings` is `#[non_exhaustive]`, so we start from Default and
+    // overwrite only the fields we care about.  tokio-quiche already defaults
+    // `alpn` to `[b"h3"]`, but we set it explicitly to document the contract:
+    // a regression that nukes the field would still fail A3 here.
     let mut settings = QuicSettings::default();
-    settings.alpn = vec![];
+    settings.alpn = vec![b"h3".to_vec()];
     settings
 }
 
