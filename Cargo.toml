@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.2.10"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -10,13 +10,9 @@ anyhow = "1.0"
 bytes = "1.11"
 clap = { version = "4.6", features = ["derive", "env"] }
 humantime = "2.1"
-tokio-rustls = "0.26.4"
-rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
-rustls-pemfile = "2.2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-h2 = "0.4.13"
 http = "1.4.0"
 thiserror = "2.0"
 tracing = "0.1"
@@ -31,9 +27,24 @@ arc-swap = "1"
 libc = "0.2"
 base64 = "0.22"
 socket2 = "0.6"
-quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
+# H3 backend: tokio-quiche wraps cloudflare/quiche with a tokio
+# event-loop driver.  `gcongestion` enables `Bbr2Gcongestion`, mapped from
+# `config::CongestionControl::Bbr`.
+#
+# Note: this is BBRv2 from the gcongestion branch, NOT BBRv1 like quinn's
+# `BbrConfig`.  Steady-state behaviour is similar; startup and loss
+# response differ.  Validated as acceptable for the proxy use-case.
+tokio-quiche = { version = "0.19", features = ["gcongestion"] }
+quiche = "0.29"
+
+# H2 backend: pingora — Cloudflare's production HTTP framework.
+# `boringssl` feature shares the BoringSSL stack with tokio-quiche/quiche.
+pingora = { version = "0.8", default-features = false, features = ["proxy", "boringssl"] }
+
+# Required only to install the default crypto provider at startup so the
+# rustls used internally by panel-http (quinn+rustls) does not panic on
+# first use.  No direct rustls usage in our own code.
+rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
 
 # ACL Engine (remote)
 acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
@@ -41,22 +52,52 @@ acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag
 # DNS resolution cache
 dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0" }
 
-# Panel Integration (HTTP direct to v2board)
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
-panel-http = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
+# Panel Integration (HTTP-based RPC — dev/master keeps this transport,
+# vs dev/agent-master's panel-connect-rpc over QUIC/H3)
+panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.17" }
+panel-http = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.17" }
 
 [[bin]]
-name = "server-naive"
+name = "server-naive-agent"
 path = "src/main.rs"
 
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.15"
 rcgen = "0.14"
-# expose ConnectionState trait so tests can read remote SETTINGS without a full h3 client loop
+criterion = { version = "0.5", features = ["html_reports"] }
+# Cross-implementation client used in quiche_runner integration tests:
+# a quinn + hyperium/h3 client drives the production tokio-quiche server.
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+# `i-implement-a-third-party-backend-and-opt-into-breaking-changes` exposes
+# the ConnectionState trait so the SETTINGS test can read negotiated flags.
 h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = "0.0.10"
+# Cross-implementation client used in pingora_runner integration smoke:
+# rustls + hyperium/h2 client drives the production pingora server.
+tokio-rustls = "0.26"
+h2 = "0.4"
 dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.15" }
+panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.17" }
+
+# Patch tokio-quiche's `datagram-socket` so it builds against
+# libc >= 0.2.169 on musl targets.  Upstream's `mmsg.rs` constructs
+# `libc::msghdr` with struct-literal syntax, but newer libc added
+# private padding fields (__pad1/__pad2), which broke compilation:
+# `cannot construct msghdr with struct literal syntax due to private
+# fields`.  This vendored copy uses `MaybeUninit::zeroed()` instead
+# (same approach as the upstream PR cloudflare/quiche#2224).
+# The patched source lives under `patches/datagram-socket/`.
+[patch.crates-io]
+datagram-socket = { path = "patches/datagram-socket" }
+
+[[bench]]
+name = "padding_phase1"
+harness = false
+
+[[bench]]
+name = "uot_alloc"
+harness = false
 
 [profile.release]
 opt-level = 3

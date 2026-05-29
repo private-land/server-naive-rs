@@ -283,6 +283,19 @@ impl std::fmt::Display for NaiveNetwork {
     }
 }
 
+/// QUIC congestion control algorithm for a naive H3 node.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CongestionControl {
+    /// BBR — bandwidth-delay product based; best for high-latency proxy links (default).
+    #[default]
+    Bbr,
+    /// CUBIC — loss-based; quinn's original default.
+    Cubic,
+    /// NewReno — classic loss-based algorithm.
+    NewReno,
+}
+
 /// Naive node configuration deserialized from panel API JSON.
 ///
 /// The panel returns `NodeConfigEnum::Naive(json_string)`.
@@ -292,6 +305,9 @@ pub struct NaiveConfig {
     /// Transport mode: "tcp" (H2+TLS, default) or "udp" (H3+QUIC).
     #[serde(default)]
     pub network: NaiveNetwork,
+    /// QUIC congestion control (H3 only).  Defaults to BBR.
+    #[serde(default)]
+    pub congestion_control: CongestionControl,
 }
 
 /// Parse a `NodeConfigEnum` into a `NaiveConfig`.
@@ -309,6 +325,7 @@ pub fn parse_naive_config(config_enum: NodeConfigEnum) -> Result<NaiveConfig> {
 
 /// Connection performance configuration
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Some fields no longer consumed by the pingora / tokio-quiche backends but kept on the CLI surface.
 pub struct ConnConfig {
     pub idle_timeout: Duration,
     pub uplink_only_timeout: Duration,
@@ -360,6 +377,8 @@ pub struct ServerConfig {
     pub acl_conf_file: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub block_private_ip: bool,
+    /// QUIC congestion control algorithm (H3 only).
+    pub congestion_control: CongestionControl,
 }
 
 impl ServerConfig {
@@ -371,6 +390,7 @@ impl ServerConfig {
             acl_conf_file: cli.acl_conf_file.clone(),
             data_dir: cli.data_dir.clone(),
             block_private_ip: cli.block_private_ip,
+            congestion_control: remote.congestion_control.clone(),
         })
     }
 }
@@ -495,6 +515,7 @@ mod tests {
         let remote = NaiveConfig {
             server_port: 443,
             network: NaiveNetwork::Tcp,
+            congestion_control: CongestionControl::default(),
         };
         let cli = create_test_cli_args();
         let config = ServerConfig::from_remote(&remote, &cli).unwrap();
