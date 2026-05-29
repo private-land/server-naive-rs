@@ -755,5 +755,132 @@ mod tests {
             accept_task.abort();
             driver_task.abort();
         }
+
+        // ── A11: client FIN propagates as Ok(0) on the server's reader ─────
+        //
+        // The peer sending end_of_stream=true on a body frame must surface as
+        // a clean EOF (0 bytes) on H3StreamReader, so `process_tunnel`'s relay
+        // can propagate the half-close downstream.  Mirrors
+        // `transport::h3::tests::test_upload_eof_propagates` for the new path.
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quiche_upload_eof_propagates() {
+            use crate::transport::quiche_stream::{H3StreamReader, H3StreamWriter};
+            use bytes::Bytes;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio_quiche::http3::driver::ServerH3Event;
+
+            install_crypto();
+            let (cert_file, key_file, cert_der) = gen_cert_files();
+            let tls = QuicheTlsPaths::new(cert_file.path(), key_file.path()).unwrap();
+            let settings = make_quiche_settings(&CongestionControl::Cubic);
+            let server_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+            let mut listener =
+                bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
+
+            const PAYLOAD: &[u8] = b"eof-test-payload";
+            let (totals_tx, totals_rx) = tokio::sync::oneshot::channel::<usize>();
+
+            let accept_task = tokio::spawn(async move {
+                let initial = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|res| res.ok());
+                let Some(conn) = initial else { return };
+                let (driver, mut controller) =
+                    tokio_quiche::ServerH3Driver::new(make_h3_settings());
+                conn.start(driver);
+
+                while let Some(event) = controller.event_receiver_mut().recv().await {
+                    if let ServerH3Event::Headers {
+                        incoming_headers, ..
+                    } = event
+                    {
+                        let IncomingH3Headers {
+                            send: mut frame_sender,
+                            recv,
+                            ..
+                        } = incoming_headers;
+
+                        let response = vec![Header::new(b":status", b"200")];
+                        frame_sender
+                            .send(OutboundFrame::Headers(response, None))
+                            .await
+                            .unwrap();
+
+                        let mut reader = H3StreamReader::new(recv);
+                        let mut writer = H3StreamWriter::new(frame_sender);
+
+                        // Drain the upload until EOF.  The asserted property
+                        // is that `read` returns Ok(0) after the client's
+                        // finish() — without that the loop would hang.
+                        let mut total = 0usize;
+                        let mut buf = vec![0u8; 1024];
+                        loop {
+                            let n = reader.read(&mut buf).await.unwrap();
+                            if n == 0 {
+                                break; // EOF — the property under test
+                            }
+                            total += n;
+                        }
+
+                        // Close our side cleanly so the client's recv_data
+                        // returns None and the test can complete.
+                        writer.shutdown().await.unwrap();
+                        let _ = totals_tx.send(total);
+                        break;
+                    }
+                }
+            });
+
+            let quic_conn = tokio::time::timeout(
+                Duration::from_secs(10),
+                quinn_connect(cert_der, server_addr),
+            )
+            .await
+            .expect("client connect should not time out")
+            .expect("client connect should succeed");
+            let h3_conn = h3_quinn::Connection::new(quic_conn);
+            let (mut h3_driver, mut send_req) = h3::client::new(h3_conn).await.unwrap();
+            let driver_task =
+                tokio::spawn(std::future::poll_fn(move |cx| h3_driver.poll_close(cx)));
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let req = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri("example.com:80")
+                .body(())
+                .unwrap();
+            let mut stream = send_req.send_request(req).await.unwrap();
+
+            let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
+                .await
+                .expect("recv_response timed out")
+                .expect("recv_response failed");
+            assert_eq!(resp.status(), http::StatusCode::OK);
+
+            stream
+                .send_data(Bytes::copy_from_slice(PAYLOAD))
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+
+            let server_total = tokio::time::timeout(Duration::from_secs(10), totals_rx)
+                .await
+                .expect("server task did not finish (EOF likely not propagating)")
+                .expect("server task closed without reporting");
+
+            assert_eq!(
+                server_total,
+                PAYLOAD.len(),
+                "server must receive exactly the bytes the client sent before finish()"
+            );
+
+            accept_task.abort();
+            driver_task.abort();
+        }
     }
 }
