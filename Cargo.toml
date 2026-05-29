@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.2.10"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -28,8 +28,12 @@ libc = "0.2"
 base64 = "0.22"
 socket2 = "0.6"
 # H3 backend: tokio-quiche wraps cloudflare/quiche with a tokio
-# event-loop driver. `gcongestion` enables BBRv2 (mapped from
-# config::CongestionControl::Bbr).
+# event-loop driver.  `gcongestion` enables `Bbr2Gcongestion`, mapped from
+# `config::CongestionControl::Bbr`.
+#
+# Note: this is BBRv2 from the gcongestion branch, NOT BBRv1 like quinn's
+# `BbrConfig`.  Steady-state behaviour is similar; startup and loss
+# response differ.  Validated as acceptable for the proxy use-case.
 tokio-quiche = { version = "0.19", features = ["gcongestion"] }
 quiche = "0.29"
 
@@ -68,6 +72,10 @@ quinn = { version = "0.11", default-features = false, features = ["rustls", "run
 # the ConnectionState trait so the SETTINGS test can read negotiated flags.
 h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "0.0.10"
+# Cross-implementation client used in pingora_runner integration smoke:
+# rustls + hyperium/h2 client drives the production pingora server.
+tokio-rustls = "0.26"
+h2 = "0.4"
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
 panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.17" }
 

@@ -1,13 +1,18 @@
 //! HTTP/2 and HTTP/3 CONNECT request handler for NaiveProxy protocol.
 //!
 //! Naive clients connect via:
-//!   CONNECT target:port HTTP/2 (or HTTP/3)
+//!   CONNECT target:port HTTP/2 (over TLS via pingora) or HTTP/3 (over
+//!     QUIC via tokio-quiche)
 //!   Proxy-Authorization: Basic base64(username:password)
 //!   Padding: <random 30-61 char value>
 //!
-//! The password field of Basic Auth contains the user's UUID.
-//! On successful auth the server responds 200 (with a Padding header) and
+//! The password field of Basic Auth contains the user's UUID.  On
+//! successful auth the server responds 200 (with a Padding header) and
 //! relays padded bytes for the first 8 frames then raw bytes thereafter.
+//!
+//! `process_h2_request_pingora` is the H2 entry; `process_h3_request_quiche`
+//! is the H3 entry.  Both converge on the shared `process_tunnel<T:
+//! AsyncRead + AsyncWrite + Send + 'static>`.
 
 use crate::acl;
 use crate::core::{copy_bidirectional_with_stats, hooks, Address, Server, UserId};
@@ -59,9 +64,22 @@ pub fn parse_basic_auth(auth_header: &str) -> Result<String> {
 // ── H2 entry point (pingora backend) ──────────────────────────────────────────
 
 /// Send a status-only error response and close the response side.
+///
+/// Errors are intentionally swallowed (best-effort): if pingora cannot
+/// flush a 4xx back to the peer the connection is already broken, so
+/// surfacing the error to the caller would only obscure the *original*
+/// failure that prompted the error response.  We trace-log so the
+/// silent-drop path is observable when needed.
 async fn send_pingora_status(session: &mut pingora::proxy::Session, status: u16) {
-    if let Ok(resp) = pingora::http::ResponseHeader::build(status, None) {
-        let _ = session.write_response_header(Box::new(resp), true).await;
+    let resp = match pingora::http::ResponseHeader::build(status, None) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!(status = status, error = %e, "send_pingora_status: build failed");
+            return;
+        }
+    };
+    if let Err(e) = session.write_response_header(Box::new(resp), true).await {
+        log::debug!(status = status, error = %e, "send_pingora_status: write failed");
     }
 }
 
@@ -73,17 +91,22 @@ async fn send_pingora_status(session: &mut pingora::proxy::Session, status: u16)
 /// `process_tunnel` keeps its `T: AsyncRead + AsyncWrite + Unpin + Send +
 /// 'static` bound.
 pub async fn process_h2_request_pingora(
-    server: &Server,
+    server: Arc<Server>,
     session: &mut pingora::proxy::Session,
     peer_addr: SocketAddr,
 ) -> Result<()> {
     use pingora::http::ResponseHeader;
 
-    // Validate method — only CONNECT is accepted.
-    let method = session.req_header().method.clone();
-    if method != http::Method::CONNECT {
+    // Validate method — only CONNECT is accepted.  Build the err message
+    // BEFORE the &mut session call so we don't borrow-conflict (and don't
+    // need to clone Method).
+    if session.req_header().method != http::Method::CONNECT {
+        let err = anyhow!(
+            "Expected CONNECT method, got {}",
+            session.req_header().method
+        );
         send_pingora_status(session, 405).await;
-        return Err(anyhow!("Expected CONNECT method, got {method}"));
+        return Err(err);
     }
 
     // Require the naive Padding header.
@@ -155,20 +178,40 @@ pub async fn process_h2_request_pingora(
 
     // Duplex pair: relay sees `client_io` as a normal AsyncRead+AsyncWrite,
     // the body bridge shuttles bytes between the pingora `Session` and
-    // `server_half`.  Both futures share this async context so we never need
-    // a `'static` task for the bridge.
+    // `server_half`.
+    //
+    // Cancel-safety rationale: spawn the tunnel onto a separate task and
+    // run the bridge inline.  When `process_tunnel` completes it drops
+    // `padded` (and the duplex's client_io with it), so the bridge's
+    // server-half `io_read` returns EOF on its next poll and the bridge
+    // exits cleanly.  If the bridge ends first (e.g., peer closed the H2
+    // session), dropping `server_half` causes `client_io` reads/writes to
+    // surface broken-pipe to the relay, which then ends `process_tunnel`.
+    // Either way both futures terminate on their own boundary instead of
+    // being abruptly dropped mid-await, which would have left the pingora
+    // Session in an undefined partial-write state.
     let buf = std::cmp::max(server.conn_config.buffer_size, BRIDGE_BUF);
     let (client_io, server_half) = tokio::io::duplex(buf);
     let padded = NaivePaddedTransport::new(client_io);
 
-    tokio::select! {
-        result = process_tunnel(server, padded, target, peer_addr, user_id, outbound_type) => {
-            result?;
-        }
-        _ = run_session_bridge(session, server_half) => {
-            // Bridge ended (session error / peer closed both sides) — that is
-            // a clean terminal state for the tunnel as well.
-        }
+    let server_for_tunnel = Arc::clone(&server);
+    let tunnel = tokio::spawn(async move {
+        process_tunnel(
+            &server_for_tunnel,
+            padded,
+            target,
+            peer_addr,
+            user_id,
+            outbound_type,
+        )
+        .await
+    });
+
+    run_session_bridge(session, server_half).await;
+
+    match tunnel.await {
+        Ok(result) => result?,
+        Err(join_err) => return Err(anyhow!("tunnel task join failed: {join_err}")),
     }
 
     Ok(())

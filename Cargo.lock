@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "server-naive-rs"
-version = "0.2.10"
+version = "0.3.0"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
@@ -3904,6 +3904,7 @@ dependencies = [
  "dashmap",
  "dns-cache-rs",
  "futures-util",
+ "h2",
  "h3",
  "h3-quinn",
  "http",
@@ -3927,6 +3928,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-quiche",
+ "tokio-rustls",
  "tokio-test",
  "tokio-util",
  "tracing",
