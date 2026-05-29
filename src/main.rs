@@ -15,9 +15,8 @@ mod core;
 mod error;
 mod handler;
 mod logger;
-mod net;
+mod pingora_runner;
 mod quiche_runner;
-mod server_runner;
 mod transport;
 mod uot;
 
@@ -27,7 +26,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use logger::log;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +34,57 @@ use crate::business::{
     ApiManager, BackgroundTasks, NaiveAuthenticator, NaiveStatsCollector, NaiveUserManager,
     NodeType, PanelApi, PanelConfig, PanelStatsCollector, TaskConfig,
 };
-use crate::core::{ConnectionManager, Server};
+use crate::core::{hooks, ConnectionManager, Server};
+use dns_cache_rs::DnsCache;
+
+/// Build the outbound router from ACL configuration, falling back to direct
+/// routing if no ACL file is configured.
+async fn build_router(
+    config: &config::ServerConfig,
+    refresh_geodata: bool,
+    dns_cache: DnsCache,
+) -> Result<Arc<dyn hooks::OutboundRouter>> {
+    use crate::acl::AclRouter;
+
+    if let Some(ref acl_path) = config.acl_conf_file {
+        if !acl_path.exists() {
+            return Err(anyhow!("ACL config file not found: {}", acl_path.display()));
+        }
+        let ext = acl_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml") {
+            return Err(anyhow!(
+                "Invalid ACL config file format: expected .yaml or .yml"
+            ));
+        }
+
+        let acl_config = acl::load_acl_config(acl_path).await?;
+        let engine =
+            acl::AclEngine::new(acl_config, Some(config.data_dir.as_path()), refresh_geodata)
+                .await?;
+
+        log::info!(
+            acl_file = %acl_path.display(),
+            rules = engine.rule_count(),
+            block_private_ip = config.block_private_ip,
+            "ACL router loaded"
+        );
+
+        Ok(Arc::new(AclRouter::with_cache(
+            engine,
+            config.block_private_ip,
+            dns_cache,
+        )) as Arc<dyn hooks::OutboundRouter>)
+    } else {
+        log::info!(
+            block_private_ip = config.block_private_ip,
+            "No ACL config, using direct connection for all traffic"
+        );
+        Ok(Arc::new(hooks::DirectRouter::with_cache(
+            config.block_private_ip,
+            dns_cache,
+        )) as Arc<dyn hooks::OutboundRouter>)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -109,8 +158,7 @@ async fn main() -> Result<()> {
     // Shared DNS cache (DnsCache: Clone is cheap — Arc-backed)
     let dns_cache = dns_cache_rs::DnsCache::new();
 
-    let router =
-        server_runner::build_router(&server_config, cli.refresh_geodata, dns_cache.clone()).await?;
+    let router = build_router(&server_config, cli.refresh_geodata, dns_cache.clone()).await?;
 
     // Resolve max_connections once and log the result
     let resolved_max = config_auto::resolve(cli.max_connections);
@@ -223,18 +271,9 @@ async fn main() -> Result<()> {
     let server_result = tokio::select! {
         result = async {
             if use_h3 {
-                match cli.h3_backend {
-                    config::H3Backend::Quinn => {
-                        log::info!(backend = "quinn", "H3 backend selected");
-                        server_runner::run_h3_server(server, &server_config).await
-                    }
-                    config::H3Backend::Quiche => {
-                        log::info!(backend = "quiche", "H3 backend selected");
-                        quiche_runner::run_h3_server_quiche(server, &server_config).await
-                    }
-                }
+                quiche_runner::run_h3_server_quiche(server, &server_config).await
             } else {
-                server_runner::run_server(server, &server_config).await
+                pingora_runner::run_h2_server_pingora(server, &server_config).await
             }
         } => result,
         _ = cancel_token.cancelled() => Ok(()),
