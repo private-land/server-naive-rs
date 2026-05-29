@@ -3,7 +3,7 @@
 mod h2;
 mod h3;
 mod padding;
-mod quiche_tls;
+pub(crate) mod quiche_tls;
 mod tls;
 
 pub use h2::H2Transport;

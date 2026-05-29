@@ -9,7 +9,27 @@
 //! The current step (A3) is just the `make_quiche_settings` builder.
 
 use crate::config;
+use crate::transport::quiche_tls::QuicheTlsPaths;
+use anyhow::Result;
+use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::settings::QuicSettings;
+use tokio_quiche::QuicConnectionStream;
+
+/// Bind a UDP socket to a tokio-quiche HTTP/3 listener.  Returns the
+/// `QuicConnectionStream` for the bound socket; each `next().await` yields one
+/// accepted (handshake-complete) QUIC connection.
+///
+/// A5 stub: returns Err so the handshake integration test fails at
+/// listener-setup; the green commit replaces this with the real `listen` call.
+pub fn bind_h3_listener(
+    _socket: tokio::net::UdpSocket,
+    _settings: QuicSettings,
+    _tls: &QuicheTlsPaths,
+) -> Result<QuicConnectionStream<DefaultMetrics>> {
+    Err(anyhow::anyhow!(
+        "bind_h3_listener: not yet implemented (A5 stub)"
+    ))
+}
 
 /// Build a `QuicSettings` for the tokio-quiche server, mirroring the tuning
 /// `server_runner::make_transport_config` applies to the quinn `TransportConfig`.
@@ -82,5 +102,102 @@ mod tests {
     fn quiche_make_settings_reno_when_newreno_requested() {
         let settings = make_quiche_settings(&CongestionControl::NewReno);
         assert_eq!(settings.cc_algorithm, "reno");
+    }
+
+    // ── A5 integration: real QUIC handshake — quinn client vs. quiche server ──
+    mod integration {
+        use super::super::*;
+        use crate::config::CongestionControl;
+        use futures_util::StreamExt;
+        use rustls::pki_types::CertificateDer;
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tempfile::NamedTempFile;
+        use tokio::net::UdpSocket;
+
+        fn install_crypto() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            });
+        }
+
+        /// Generate a self-signed cert pair, write PEMs to temp files, and
+        /// return the DER cert too so the quinn client can trust it.
+        fn gen_cert_files() -> (NamedTempFile, NamedTempFile, CertificateDer<'static>) {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let mut cert_file = NamedTempFile::new().unwrap();
+            cert_file.write_all(cert.pem().as_bytes()).unwrap();
+            cert_file.flush().unwrap();
+            let mut key_file = NamedTempFile::new().unwrap();
+            key_file
+                .write_all(signing_key.serialize_pem().as_bytes())
+                .unwrap();
+            key_file.flush().unwrap();
+            let cert_der: CertificateDer<'static> = cert.into();
+            (cert_file, key_file, cert_der)
+        }
+
+        async fn quinn_connect(
+            cert: CertificateDer<'static>,
+            server_addr: std::net::SocketAddr,
+        ) -> anyhow::Result<quinn::Connection> {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert)?;
+            let mut tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tls.alpn_protocols = vec![b"h3".to_vec()];
+            let cc = quinn::ClientConfig::new(Arc::new(
+                quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+            ));
+            let mut ep = quinn::Endpoint::client("[::]:0".parse()?)?;
+            ep.set_default_client_config(cc);
+            Ok(ep.connect(server_addr, "localhost")?.await?)
+        }
+
+        /// A5 — Bringing up a quiche listener and connecting from a quinn
+        /// client must complete the QUIC TLS 1.3 handshake with ALPN `h3`
+        /// negotiated.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn quiche_accept_quic_handshake() {
+            install_crypto();
+            let (cert_file, key_file, cert_der) = gen_cert_files();
+            let tls = QuicheTlsPaths::new(cert_file.path(), key_file.path()).unwrap();
+            let settings = make_quiche_settings(&CongestionControl::Cubic);
+
+            let server_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+
+            let mut listener =
+                bind_h3_listener(server_socket, settings, &tls).expect("listener bind");
+
+            // Drive the listener long enough for the QUIC handshake to land.
+            // We don't need to do anything with the accepted connection for
+            // A5 — completion of `.next()` (handshake done server-side) is
+            // sufficient.
+            let accept_task = tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), listener.next()).await;
+            });
+
+            let conn =
+                tokio::time::timeout(Duration::from_secs(5), quinn_connect(cert_der, server_addr))
+                    .await
+                    .expect("client connect should not time out")
+                    .expect("client connect should succeed");
+
+            // ALPN check: quinn surfaces the negotiated protocol via
+            // handshake_data downcast to rustls::HandshakeData.
+            let hd = conn
+                .handshake_data()
+                .and_then(|hd| hd.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .expect("handshake data should be rustls");
+            assert_eq!(hd.protocol.as_deref(), Some(&b"h3"[..]), "ALPN must be h3");
+
+            drop(conn);
+            let _ = accept_task.await;
+        }
     }
 }

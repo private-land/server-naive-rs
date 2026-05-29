@@ -8,14 +8,13 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
 /// Owns PEM cert/key file paths for tokio-quiche TLS configuration.
-#[allow(dead_code)] // wired into runtime starting in A5; kept allow until then.
 #[derive(Debug)]
 pub struct QuicheTlsPaths {
     cert: String,
     private_key: String,
 }
 
-#[allow(dead_code)] // wired into runtime starting in A5; kept allow until then.
+#[allow(dead_code)] // accessors live for the bin until run_h3_server_quiche wires them
 impl QuicheTlsPaths {
     /// Validate cert/key paths are readable PEM files and return an owner that
     /// can later be borrowed as `tokio_quiche::settings::TlsCertificatePaths`.
