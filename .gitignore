@@ -21,3 +21,6 @@ docs/specs/
 singbox-test*.json
 web-key.txt
 scripts/
+
+# Local agent design artifacts
+/.superpowers/
