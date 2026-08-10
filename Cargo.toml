@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 
 [dependencies]
@@ -47,15 +47,15 @@ pingora = { version = "0.8", default-features = false, features = ["proxy", "bor
 rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
 
 # ACL Engine (remote)
-acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
+acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.5", features = ["async"] }
 
 # DNS resolution cache
-dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0" }
+dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1" }
 
 # Panel Integration (HTTP-based RPC — dev/master keeps this transport,
 # vs dev/agent-master's panel-connect-rpc over QUIC/H3)
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.17" }
-panel-http = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.17" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
+panel-http = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
 
 [[bin]]
 name = "server-naive"
@@ -77,8 +77,8 @@ h3-quinn = "0.0.10"
 # rustls + hyperium/h2 client drives the production pingora server.
 tokio-rustls = "0.26"
 h2 = "0.4"
-dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.17" }
+dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1", features = ["test-utils"] }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
 
 # Patch tokio-quiche's `datagram-socket` so it builds against
 # libc >= 0.2.169 on musl targets.  Upstream's `mmsg.rs` constructs
