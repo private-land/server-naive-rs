@@ -57,26 +57,41 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
           fi
 
-      - name: Install zig (MUSL)
-        if: contains(matrix.target, '-musl')
+      # MUSL toolchain split by arch:
+      #   x86_64-musl builds fine with zig (cargo-zigbuild).
+      #   aarch64-musl does NOT: zig's C build of aws-lc-sys drops cbs.o
+      #   (CBS/bytestring), so aws-lc's own ASN.1 objects fail to link with
+      #   undefined aws_lc_*_CBS_*. aarch64-musl therefore uses a real
+      #   aarch64-linux-musl-gcc cross toolchain (same idea as aarch64-gnu
+      #   using real gcc), which produces a complete aws-lc archive.
+      - name: Install zig (x86_64 MUSL)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
 
-      - name: Install cargo-zigbuild (MUSL)
-        if: contains(matrix.target, '-musl')
+      - name: Install cargo-zigbuild (x86_64 MUSL)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo install cargo-zigbuild
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Isolate the cache per release variant and bump the version to
-          # evict poisoned caches. Both variants previously shared
-          # `key: <target>`, so restore-keys fallback let the agent build
-          # restore the master build's aws-lc-sys artifacts (different
-          # feature unification) and fail to link undefined aws_lc_*_CBS_*
-          # symbols on musl.
-          prefix-key: "v2-${{ env.BINARY_NAME }}"
-          key: ${{ matrix.target }}
+      - name: Install musl cross toolchain (aarch64 MUSL)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          # GitHub-CDN-hosted musl-cross toolchain (reliable from Actions;
+          # musl.cc throttles cloud IPs and times out). Pinned release.
+          # Extracts to /opt/aarch64-unknown-linux-musl with the
+          # aarch64-unknown-linux-musl-* tool prefix.
+          url="https://github.com/cross-tools/musl-cross/releases/download/20260515/aarch64-unknown-linux-musl.tar.xz"
+          curl -fL --retry 5 --retry-delay 5 --retry-connrefused \
+            --connect-timeout 30 --max-time 600 -o /tmp/aarch64-musl.tar.xz "$url"
+          sudo tar -xJf /tmp/aarch64-musl.tar.xz -C /opt
+          echo "/opt/aarch64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
+          /opt/aarch64-unknown-linux-musl/bin/aarch64-unknown-linux-musl-gcc --version | head -1
+
+      # rust-cache is intentionally NOT used for release builds: it had cached
+      # a partial aws-lc-sys archive across runs. Release builds are
+      # infrequent, so build clean every time.
 
       - name: Build (GNU)
         if: contains(matrix.target, '-gnu')
@@ -90,9 +105,22 @@ jobs:
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (MUSL)
-        if: contains(matrix.target, '-musl')
+      - name: Build (x86_64 MUSL, zigbuild)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build (aarch64 MUSL, real musl-gcc)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-unknown-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-gcc
+          CXX_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-g++
+          AR_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-ar
+          # bindgen (boring-sys, aws-lc-sys) runs libclang, which otherwise
+          # reads the host glibc headers and fails ('bits/libc-header-start.h'
+          # not found). Point it at the musl toolchain sysroot.
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl: "--target=aarch64-unknown-linux-musl --sysroot=/opt/aarch64-unknown-linux-musl/aarch64-unknown-linux-musl/sysroot"
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
