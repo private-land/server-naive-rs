@@ -65,7 +65,11 @@ jobs:
 
       - name: Install cargo-zigbuild (MUSL)
         if: contains(matrix.target, '-musl')
-        run: cargo install cargo-zigbuild
+        # Pinned: cargo-zigbuild 0.23.0 regressed static linking of the
+        # aws-lc-sys archive on aarch64-musl for the agent build (undefined
+        # aws_lc_*_CBS_* ASN.1 symbols at link time). 0.22.3 is the last
+        # version that linked this target's larger QUIC/H3 dep graph cleanly.
+        run: cargo install cargo-zigbuild --version 0.22.3 --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
