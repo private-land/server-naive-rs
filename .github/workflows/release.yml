@@ -77,9 +77,17 @@ jobs:
       - name: Install musl cross toolchain (aarch64 MUSL)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-musl-cross.tgz
-          sudo tar -xzf /tmp/aarch64-musl-cross.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          # GitHub-CDN-hosted musl-cross toolchain (reliable from Actions;
+          # musl.cc throttles cloud IPs and times out). Pinned release.
+          # Extracts to /opt/aarch64-unknown-linux-musl with the
+          # aarch64-unknown-linux-musl-* tool prefix.
+          url="https://github.com/cross-tools/musl-cross/releases/download/20260515/aarch64-unknown-linux-musl.tar.xz"
+          curl -fL --retry 5 --retry-delay 5 --retry-connrefused \
+            --connect-timeout 30 --max-time 600 -o /tmp/aarch64-musl.tar.xz "$url"
+          sudo tar -xJf /tmp/aarch64-musl.tar.xz -C /opt
+          echo "/opt/aarch64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
+          /opt/aarch64-unknown-linux-musl/bin/aarch64-unknown-linux-musl-gcc --version | head -1
 
       # rust-cache is intentionally NOT used for release builds: it had cached
       # a partial aws-lc-sys archive across runs. Release builds are
@@ -104,10 +112,10 @@ jobs:
       - name: Build (aarch64 MUSL, real musl-gcc)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          CXX_aarch64_unknown_linux_musl: aarch64-linux-musl-g++
-          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-unknown-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-gcc
+          CXX_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-g++
+          AR_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-ar
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
