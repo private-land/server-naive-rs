@@ -65,7 +65,11 @@ jobs:
 
       - name: Install cargo-zigbuild (MUSL)
         if: contains(matrix.target, '-musl')
-        run: cargo install cargo-zigbuild
+        # Pinned for the agent variant only: with the rust-cache poisoning
+        # fixed, aarch64-musl still fails to link aws_lc_*_CBS_* under
+        # cargo-zigbuild 0.23.0. 0.22.3 is the version that linked this
+        # target's QUIC/H3 dep graph cleanly for av0.3.1.
+        run: cargo install cargo-zigbuild --version 0.22.3 --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
