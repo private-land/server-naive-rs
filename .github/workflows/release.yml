@@ -116,6 +116,10 @@ jobs:
           CC_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-gcc
           CXX_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-g++
           AR_aarch64_unknown_linux_musl: aarch64-unknown-linux-musl-ar
+          # bindgen (boring-sys, aws-lc-sys) runs libclang, which otherwise
+          # reads the host glibc headers and fails ('bits/libc-header-start.h'
+          # not found). Point it at the musl toolchain sysroot.
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl: "--target=aarch64-unknown-linux-musl --sysroot=/opt/aarch64-unknown-linux-musl/aarch64-unknown-linux-musl/sysroot"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
