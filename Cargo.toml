@@ -1,6 +1,6 @@
 [package]
 name = "server-naive-rs"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 
 [dependencies]
@@ -53,8 +53,8 @@ acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1" }
 
 # Panel Integration (Connect-RPC via QUIC/H3)
-panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
-panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.20" }
+panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.20" }
 
 [[bin]]
 name = "server-naive-agent"
@@ -77,7 +77,7 @@ h3-quinn = "0.0.10"
 tokio-rustls = "0.26"
 h2 = "0.4"
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1", features = ["test-utils"] }
-panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.20" }
 
 # Patch tokio-quiche's `datagram-socket` so it builds against
 # libc >= 0.2.169 on musl targets.  Upstream's `mmsg.rs` constructs
