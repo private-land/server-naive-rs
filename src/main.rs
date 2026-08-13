@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         api_timeout: cli.api_timeout,
         debug: cli.log_mode == "debug",
         ip_version: cli.panel_ip_version,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
 
     let api_manager = Arc::new(ApiManager::new(panel_config)?);
