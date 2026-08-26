@@ -1,7 +1,7 @@
 //! DNS resolution for naive-rs.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use dns_cache_rs::{DnsCache, DnsError};
 
@@ -44,12 +44,20 @@ pub async fn resolve_socket_addr(cache: &DnsCache, addr: &Address) -> io::Result
     }
 }
 
+/// Resolve `addr` and, when `block_private_ip` is honored by the caller, report
+/// whether it maps to a private/loopback address.
+///
+/// Returns `(is_private, resolved)`. On a domain, `resolved` carries **all**
+/// public IPs (both families when present) so the connect path can try each and
+/// so a custom-dial direct outbound receives both families for mode/family
+/// fallback. If *any* resolved IP is private the whole target is rejected
+/// (`(true, None)`). IP literals and resolution failures yield `None`.
 pub(crate) async fn check_private_and_resolve(
     cache: &DnsCache,
     addr: &Address,
-) -> (bool, Option<SocketAddr>) {
+) -> (bool, Option<std::sync::Arc<[IpAddr]>>) {
     use super::ip_filter::{is_private_ipv4, is_private_ipv6};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     match addr {
         Address::IPv4(ip, _) => {
@@ -65,7 +73,7 @@ pub(crate) async fn check_private_and_resolve(
                 Ok(it) => it,
                 Err(_) => return (false, None),
             };
-            let mut first_public: Option<SocketAddr> = None;
+            let mut public: Vec<IpAddr> = Vec::new();
             for sa in it {
                 match sa.ip() {
                     IpAddr::V4(ipv4) if is_private_ipv4(&ipv4) => {
@@ -74,14 +82,14 @@ pub(crate) async fn check_private_and_resolve(
                     IpAddr::V6(ipv6) if is_private_ipv6(&ipv6) => {
                         return (true, None);
                     }
-                    _ => {
-                        if first_public.is_none() {
-                            first_public = Some(sa);
-                        }
-                    }
+                    ip => public.push(ip),
                 }
             }
-            (false, first_public)
+            if public.is_empty() {
+                (false, None)
+            } else {
+                (false, Some(std::sync::Arc::from(public)))
+            }
         }
     }
 }
