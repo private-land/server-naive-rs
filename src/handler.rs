@@ -25,7 +25,7 @@ use crate::uot;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use socket2::{SockRef, TcpKeepalive};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -393,13 +393,13 @@ where
 
     // Handle regular TCP tunnel based on outbound type.
     match outbound_type {
-        hooks::OutboundType::Direct { resolved, handler } => {
+        hooks::OutboundType::Direct { resolved, dialer } => {
             handle_direct_connect(
                 server,
                 &mut padded,
                 &target,
                 resolved,
-                handler,
+                dialer,
                 peer_addr,
                 user_id,
                 cancel_token,
@@ -509,14 +509,30 @@ where
 
 // ── Outbound connect handlers ─────────────────────────────────────────────────
 
+/// Collapse a resolved IP list into a `ResolveInfo` (one IPv4 + one IPv6) that a
+/// custom-dial `Direct` handler consumes instead of re-resolving. All IPs have
+/// already passed the router's private-IP (SSRF) check. Both families must be
+/// carried so acl-engine's Prefer64/Prefer46 connection-level fallback can fire.
+fn resolve_info_from_ips(ips: &[IpAddr]) -> acl::ResolveInfo {
+    let mut info = acl::ResolveInfo::new();
+    for ip in ips {
+        match ip {
+            IpAddr::V4(v4) if info.ipv4.is_none() => info.ipv4 = Some(*v4),
+            IpAddr::V6(v6) if info.ipv6.is_none() => info.ipv6 = Some(*v6),
+            _ => {}
+        }
+    }
+    info
+}
+
 /// Handle direct connection to target.
 #[allow(clippy::too_many_arguments)]
 async fn handle_direct_connect<T>(
     server: &Server,
     padded: &mut NaivePaddedTransport<T>,
     target: &Address,
-    resolved: Option<std::net::SocketAddr>,
-    handler: Option<Arc<acl::OutboundHandler>>,
+    resolved: Option<Arc<[IpAddr]>>,
+    dialer: Option<Arc<acl::OutboundHandler>>,
     peer_addr: SocketAddr,
     user_id: UserId,
     cancel_token: CancellationToken,
@@ -524,15 +540,17 @@ async fn handle_direct_connect<T>(
 where
     T: tokio::io::AsyncRead + AsyncWrite + Unpin,
 {
-    // When an ACL handler is present, delegate dialing to it.
-    if let Some(handler) = handler {
+    // Custom-dial direct: dial through the handler so its bind/mode/TCP options
+    // apply. Feed it the router's already-SSRF-checked IPs (both families) so it
+    // binds and applies mode/family fallback without re-resolving — a fresh
+    // lookup could reach an unchecked, private IP.
+    if let Some(handler) = dialer {
         use acl::{Addr as AclAddr, AsyncOutbound};
 
-        let mut acl_addr = if let Some(addr) = resolved {
-            AclAddr::from_socket_addr(addr)
-        } else {
-            AclAddr::new(target.host().into_owned(), target.port())
-        };
+        let mut acl_addr = AclAddr::new(target.host().into_owned(), target.port());
+        if let Some(ips) = resolved.as_deref() {
+            acl_addr = acl_addr.with_resolve_info(resolve_info_from_ips(ips));
+        }
 
         let mut remote_stream = match tokio::time::timeout(
             server.conn_config.connect_timeout,
@@ -564,39 +582,20 @@ where
         .await;
     }
 
-    // Fast path: plain TcpStream::connect with keepalive and nodelay.
-    let remote_addr = match resolved {
-        Some(addr) => addr,
-        None => crate::core::dns::resolve_socket_addr(&server.dns_cache, target).await?,
-    };
-
-    let mut remote_stream = match tokio::time::timeout(
-        server.conn_config.connect_timeout,
-        TcpStream::connect(remote_addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => {
-            if server.conn_config.tcp_nodelay {
-                let _ = s.set_nodelay(true);
-            }
-            let ka = TcpKeepalive::new()
-                .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
-                .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
-            let _ = SockRef::from(&s).set_tcp_keepalive(&ka);
-            s
-        }
-        Ok(Err(e)) => {
+    // Plain path: TcpStream::connect with keepalive and nodelay. When the router
+    // pre-resolved (both families possible), try each address with its own
+    // connect timeout so a dead preferred-family address falls back to the
+    // other; otherwise resolve from the address variant. connect_direct owns its
+    // per-address timeouts, so it is not wrapped here.
+    let mut remote_stream = match connect_direct(server, target, resolved.as_deref()).await {
+        Ok(s) => s,
+        Err(e) => {
             log::debug!(peer = %peer_addr, target = %target, error = %e, "TCP connect failed");
             return Err(e.into());
         }
-        Err(_) => {
-            log::debug!(peer = %peer_addr, target = %target, "TCP connect timeout");
-            return Err(anyhow!("TCP connect timeout"));
-        }
     };
 
-    log::debug!(peer = %peer_addr, remote = %remote_addr, "Connected to remote (direct)");
+    log::debug!(peer = %peer_addr, target = %target, "Connected to remote (direct)");
     relay(
         server,
         padded,
@@ -607,6 +606,75 @@ where
         cancel_token,
     )
     .await
+}
+
+/// Apply the outbound TCP options (nodelay + keepalive) to a freshly-connected
+/// stream.
+fn apply_socket_opts(s: &TcpStream, tcp_nodelay: bool) {
+    if tcp_nodelay {
+        let _ = s.set_nodelay(true);
+    }
+    let ka = TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+        .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
+    let _ = SockRef::from(s).set_tcp_keepalive(&ka);
+}
+
+/// Connect to `addr` with a per-attempt timeout, applying socket options on
+/// success. A timeout is surfaced as a `TimedOut` io error.
+async fn connect_one(
+    addr: SocketAddr,
+    tcp_nodelay: bool,
+    timeout: std::time::Duration,
+) -> std::io::Result<TcpStream> {
+    let s = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+    apply_socket_opts(&s, tcp_nodelay);
+    Ok(s)
+}
+
+/// Try each IP in order, giving **each** attempt its own `per_addr_timeout` so a
+/// dead (refused or black-holed) address is skipped and a later live one still
+/// connects. Returns the last error if all fail.
+async fn connect_ip_list(
+    ips: &[IpAddr],
+    port: u16,
+    tcp_nodelay: bool,
+    per_addr_timeout: std::time::Duration,
+) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for ip in ips {
+        match connect_one(SocketAddr::new(*ip, port), tcp_nodelay, per_addr_timeout).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("no resolved addresses to connect")))
+}
+
+/// Establish a plain direct TCP connection, applying nodelay + keepalive.
+///
+/// When `resolved` holds the router's SSRF-checked IPs, each is tried in order
+/// with its own `connect_timeout` (per-address fallback); otherwise the
+/// target's own address variant is resolved. Owns its timeouts — the caller
+/// must not wrap it in another one, or the per-address budget collapses.
+async fn connect_direct(
+    server: &Server,
+    target: &Address,
+    resolved: Option<&[IpAddr]>,
+) -> std::io::Result<TcpStream> {
+    let tcp_nodelay = server.conn_config.tcp_nodelay;
+    let connect_timeout = server.conn_config.connect_timeout;
+
+    if let Some(ips) = resolved {
+        if !ips.is_empty() {
+            return connect_ip_list(ips, target.port(), tcp_nodelay, connect_timeout).await;
+        }
+    }
+
+    let remote_addr = crate::core::dns::resolve_socket_addr(&server.dns_cache, target).await?;
+    connect_one(remote_addr, tcp_nodelay, connect_timeout).await
 }
 
 /// Handle connection via ACL proxy outbound.
@@ -718,5 +786,67 @@ mod tests {
     fn test_keepalive_and_shutdown_constants() {
         assert_eq!(TCP_KEEPALIVE_SECS, 15);
         assert_eq!(SHUTDOWN_TIMEOUT, std::time::Duration::from_secs(5));
+    }
+
+    /// A mixed resolution must yield one IPv4 AND one IPv6 in the `ResolveInfo`
+    /// handed to a custom-dial direct outbound. Both families are required for
+    /// acl-engine's Prefer64/Prefer46 connection-level fallback to engage — with
+    /// only one family populated the preferred-family failure has nothing to fall
+    /// back to.
+    #[test]
+    fn resolve_info_from_ips_picks_one_per_family() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4a = Ipv4Addr::new(1, 2, 3, 4);
+        let v4b = Ipv4Addr::new(5, 6, 7, 8);
+        let v6a = Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1);
+        let ips = [IpAddr::V6(v6a), IpAddr::V4(v4a), IpAddr::V4(v4b)];
+        let info = resolve_info_from_ips(&ips);
+        assert_eq!(info.ipv4, Some(v4a), "first IPv4 must be captured");
+        assert_eq!(info.ipv6, Some(v6a), "first IPv6 must be captured");
+    }
+
+    /// A single-family resolution must leave the other family `None` (nothing to
+    /// invent), while still populating the family that is present.
+    #[test]
+    fn resolve_info_from_ips_single_family() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let v4 = Ipv4Addr::new(9, 9, 9, 9);
+        let info = resolve_info_from_ips(&[IpAddr::V4(v4)]);
+        assert_eq!(info.ipv4, Some(v4));
+        assert_eq!(info.ipv6, None);
+    }
+
+    /// Multi-address fallback: a dead address must not block a live one. Each
+    /// attempt carries its own timeout, so a preceding refused/black-holed
+    /// address is skipped and a later live address still connects.
+    #[tokio::test]
+    async fn connect_ip_list_falls_back_past_dead_address() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Live listener on 127.0.0.1; 127.0.0.2 has no listener on that port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dead = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let live = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        let stream = connect_ip_list(&[dead, live], port, true, std::time::Duration::from_secs(2))
+            .await
+            .expect("must fall back to the live address");
+        assert_eq!(stream.peer_addr().unwrap().ip(), live);
+    }
+
+    /// When every address fails, the last error is surfaced rather than a
+    /// generic success.
+    #[tokio::test]
+    async fn connect_ip_list_all_dead_returns_error() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Bind then drop to obtain a port with no listener, then try two dead IPs.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let a = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let b = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+        let result = connect_ip_list(&[a, b], port, true, std::time::Duration::from_secs(1)).await;
+        assert!(result.is_err(), "all-dead list must return an error");
     }
 }

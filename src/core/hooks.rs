@@ -3,7 +3,8 @@
 use super::address::Address;
 use async_trait::async_trait;
 use dns_cache_rs::DnsCache;
-use std::net::SocketAddr;
+use std::net::IpAddr;
+use std::sync::Arc;
 
 pub type UserId = i64;
 
@@ -27,27 +28,29 @@ pub trait OutboundRouter: Send + Sync {
 
 #[derive(Clone)]
 pub enum OutboundType {
+    /// Direct connection, optionally carrying the router's already-SSRF-checked
+    /// resolved IPs (both families when available) so the connect path does not
+    /// re-resolve to an unchecked address.
+    ///
+    /// `dialer` is set for a `direct` outbound with custom dialing options
+    /// (bind/mode/fastOpen/nodelay/keepalive/connectTimeout) that the bare
+    /// connect path cannot apply: the connect path dials through it, feeding it
+    /// `resolved` via `ResolveInfo` so the handler binds and applies mode/family
+    /// fallback without re-resolving. `None` means a plain direct connection.
     Direct {
-        resolved: Option<SocketAddr>,
-        handler: Option<std::sync::Arc<crate::acl::OutboundHandler>>,
+        resolved: Option<Arc<[IpAddr]>>,
+        dialer: Option<Arc<crate::acl::OutboundHandler>>,
     },
     Reject,
-    Proxy(std::sync::Arc<crate::acl::OutboundHandler>),
+    Proxy(Arc<crate::acl::OutboundHandler>),
 }
 
 impl std::fmt::Debug for OutboundType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            OutboundType::Direct { dialer: None, .. } => write!(f, "Direct"),
             OutboundType::Direct {
-                resolved: None,
-                handler: None,
-            } => write!(f, "Direct"),
-            OutboundType::Direct {
-                resolved: Some(addr),
-                ..
-            } => write!(f, "Direct({})", addr),
-            OutboundType::Direct {
-                handler: Some(h), ..
+                dialer: Some(h), ..
             } => write!(f, "Direct({:?})", h),
             OutboundType::Reject => write!(f, "Reject"),
             OutboundType::Proxy(h) => write!(f, "Proxy({:?})", h),
@@ -79,14 +82,20 @@ impl OutboundRouter for DirectRouter {
             if is_private {
                 return OutboundType::Reject;
             }
+            // Fail closed: a domain we could not resolve (so could not private-IP
+            // check) must not fall through to a connect path that re-resolves it
+            // through an unchecked resolver. IP literals were already checked.
+            if resolved.is_none() && matches!(addr, Address::Domain(..)) {
+                return OutboundType::Reject;
+            }
             return OutboundType::Direct {
                 resolved,
-                handler: None,
+                dialer: None,
             };
         }
         OutboundType::Direct {
             resolved: None,
-            handler: None,
+            dialer: None,
         }
     }
 }
@@ -124,7 +133,7 @@ mod tests {
             router.route(&addr).await,
             OutboundType::Direct {
                 resolved: None,
-                handler: None
+                dialer: None
             }
         ));
     }
@@ -137,7 +146,7 @@ mod tests {
             router.route(&addr).await,
             OutboundType::Direct {
                 resolved: None,
-                handler: None
+                dialer: None
             }
         ));
     }
@@ -168,5 +177,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Fail-closed SSRF guard: an unresolvable domain must be rejected under
+    /// `block_private_ip` rather than fall through to Direct (which re-resolves
+    /// at dial time through an unchecked resolver).
+    #[tokio::test]
+    async fn test_direct_router_rejects_unresolvable_domain_under_block() {
+        let cache = mock_cache_with(
+            "flaky.example",
+            Err(dns_cache_rs::DnsError::NotFound("flaky.example".into())),
+        );
+        let router = DirectRouter::with_cache(true, cache);
+        let addr = Address::Domain("flaky.example".to_string(), 80);
+        assert!(matches!(router.route(&addr).await, OutboundType::Reject));
     }
 }
